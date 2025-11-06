@@ -1,0 +1,105 @@
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand::rngs::OsRng;
+
+use crate::transaction::{Transaction, TransactionConstructor};
+
+#[derive(Debug, Clone)]
+pub struct Wallet {
+    private_key: SigningKey,
+    public_key: VerifyingKey,
+}
+
+impl Wallet {
+    pub fn new() -> Self {
+        let mut csprng = OsRng;
+        let private_key = SigningKey::generate(&mut csprng);
+        let public_key = private_key.verifying_key();
+
+        Self {
+            private_key,
+            public_key,
+        }
+    }
+
+    /// Deterministic key generation from password/seed
+    pub fn from_seed(seed: &str) -> Self {
+        // Hash the seed to get 32 bytes
+        let hash = blake3::hash(seed.as_bytes());
+        let bytes: [u8; 32] = hash.into();
+
+        // Generate key from those 32 bytes
+        let private_key = SigningKey::from_bytes(&bytes);
+        let public_key = private_key.verifying_key();
+
+        Self {
+            private_key,
+            public_key,
+        }
+    }
+
+    pub fn address(&self) -> &VerifyingKey {
+        &self.public_key
+    }
+
+    pub fn create_transaction(
+        &mut self,
+        receiver_address: &VerifyingKey,
+        amount: u64,
+    ) -> Transaction {
+        TransactionConstructor::new_transaction(
+            &self.public_key,
+            receiver_address,
+            amount,
+            &mut self.private_key,
+        )
+    }
+}
+
+impl Default for Wallet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wallet_creation() {
+        let wallet = Wallet::new();
+        let address = wallet.address();
+
+        assert!(!address.as_bytes().is_empty());
+    }
+
+    #[test]
+    fn test_wallet_from_seed() {
+        let seed = "my_secure_seed";
+        let wallet1 = Wallet::from_seed(seed);
+        let wallet2 = Wallet::from_seed(seed);
+
+        assert_eq!(wallet1.address(), wallet2.address());
+    }
+
+    #[test]
+    fn test_wallet_unique_addresses() {
+        let wallet1 = Wallet::new();
+        let wallet2 = Wallet::new();
+
+        assert_ne!(wallet1.address(), wallet2.address());
+    }
+
+    #[test]
+    fn test_wallet_create_transaction() {
+        let mut sender = Wallet::new();
+        let receiver = Wallet::new();
+
+        let tx = sender.create_transaction(receiver.address(), 100);
+
+        assert_eq!(tx.sender(), sender.address());
+        assert_eq!(tx.receiver(), receiver.address());
+        assert_eq!(tx.amount(), 100);
+        assert!(tx.validate().is_ok());
+    }
+}
