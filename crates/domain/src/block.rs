@@ -127,6 +127,10 @@ impl Block {
     pub fn difficulty(&self) -> usize {
         self.difficulty
     }
+
+    pub fn index(&self) -> u64 {
+        self.inner.index
+    }
 }
 
 mod utils {

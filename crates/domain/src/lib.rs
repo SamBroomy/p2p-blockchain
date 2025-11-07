@@ -1,8 +1,8 @@
 mod block;
 mod blockchain;
 mod crypto;
-mod transaction;
 mod mempool;
+mod transaction;
 mod wallet;
 
 pub use block::{Block, BlockConstructor};
