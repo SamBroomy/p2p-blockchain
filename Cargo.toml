@@ -9,7 +9,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-domain = { workspace = true }
 serde_json = { workspace = true }
 
 
@@ -38,7 +37,24 @@ serde_json = { version = "1" }
 hex = { version = "0.4", features = ["serde"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 thiserror = "2.0"
-domain = { path = "crates/domain" }
+libp2p = { version = "0.56", features = [
+    "tokio",
+    "gossipsub",
+    "mdns",
+    "noise",
+    "macros",
+    "tcp",
+    "yamux",
+    "quic",
+] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+blockchain-types = { path = "crates/blockchain-types" }
+blockchain = { path = "crates/blockchain" }
+mempool = { path = "crates/mempool" }
+network = { path = "crates/network" }
+node = { path = "crates/node" }
 
 [workspace.lints.clippy]
 

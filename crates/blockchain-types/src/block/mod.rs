@@ -5,8 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
 
-use super::Transaction;
-use crate::blockchain::{Address, transaction::TransactionConstructor};
+use crate::{Transaction, transaction::TransactionConstructor, wallet::Address};
 
 #[derive(Debug, Clone)]
 pub struct BlockConstructor {
@@ -39,7 +38,7 @@ impl BlockConstructor {
             max_tx
         );
         debug_assert!(
-            transactions.iter().all(|tx| tx.validate().is_ok()),
+            transactions.iter().all(|tx| tx.is_validate()),
             "All transactions must be valid before mining"
         );
         let mut all_transactions = Vec::new();
@@ -48,7 +47,7 @@ impl BlockConstructor {
         if let Some(miner_addr) = miner_address {
             let reward_tx = TransactionConstructor::block_reward(&miner_addr, 50);
             debug_assert!(
-                reward_tx.validate().is_ok(),
+                reward_tx.is_validate(),
                 "Block reward transaction must be valid"
             );
             all_transactions.push(reward_tx);
@@ -160,7 +159,7 @@ impl Block {
             inner.hash()
         );
         debug_assert!(
-            inner.transactions.iter().all(|tx| tx.validate().is_ok()),
+            inner.transactions.iter().all(|tx| tx.is_validate()),
             "All transactions in block must be valid"
         );
         // Validate block reward structure if present
@@ -314,7 +313,7 @@ mod utils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Wallet;
+    use crate::wallet::Wallet;
 
     #[test]
     fn test_mine_block_with_zero_difficulty() {
@@ -402,7 +401,7 @@ mod tests {
         );
         assert_eq!(reward_tx.amount(), 50, "Block reward should be 50");
         assert!(
-            reward_tx.validate().is_ok(),
+            reward_tx.is_validate(),
             "Block reward transaction should be valid"
         );
     }

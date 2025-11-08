@@ -1,24 +1,12 @@
-mod address;
-mod block;
-mod chain;
-mod orphan_pool;
-mod transaction;
-mod wallet;
-
 use std::collections::{HashMap, VecDeque};
 
-pub use address::Address;
 use blake3::Hash;
-pub use block::{Block, BlockConstructor};
-pub use transaction::Transaction;
-pub use wallet::Wallet;
+use blockchain_types::{Block, BlockConstructor, GENESIS_ROOT_HASH, Transaction};
 
-use crate::blockchain::{
+use crate::{
     chain::{Chain, ForkChain, RootChain, is_connecting_block_valid},
     orphan_pool::OrphanPool,
 };
-
-const GENESIS_ROOT_HASH: Hash = Hash::from_bytes([0u8; blake3::OUT_LEN]);
 
 /// Result of attempting to add a block
 #[derive(Debug)]
@@ -100,6 +88,11 @@ impl BlockChain {
             orphan_pool: OrphanPool::new(),
             difficulty,
         }
+    }
+
+    /// Validate transactions against current balances
+    pub fn validate_transaction(&self, tx: &Transaction) -> bool {
+        self.main_chain.validate_transaction(tx)
     }
 
     /// Add a block with orphan handling
@@ -185,7 +178,7 @@ impl BlockChain {
                     HashMap::new()
                 } else {
                     // Recalculate balances up to and including the connection block
-                    chain::recalculate_balances(&self.main_chain.blocks()[..=connection_idx])
+                    super::chain::recalculate_balances(&self.main_chain.blocks()[..=connection_idx])
                 };
 
             // Create a new fork with just this block
@@ -374,6 +367,10 @@ impl BlockChain {
     pub fn latest_block_hash(&self) -> &Hash {
         self.main_chain.tip_hash()
     }
+
+    pub fn cumulative_difficulty(&self) -> u128 {
+        self.main_chain.cumulative_difficulty()
+    }
 }
 
 #[cfg(test)]
@@ -381,8 +378,9 @@ mod tests {
 
     use std::assert_matches::assert_matches;
 
+    use blockchain_types::{Transaction, wallet::Wallet};
+
     use super::*;
-    use crate::{BlockConstructor, Wallet};
 
     fn mine_block(
         index: u64,
@@ -1090,11 +1088,17 @@ mod tests {
         let block_a = mine_block(1, genesis_hash, &[tx1], 1);
         let block_a_hash = *block_a.hash();
         let _ = blockchain.add_block(block_a).ok();
+        assert_eq!(blockchain.cumulative_difficulty(), 2 + 2, "After block A");
 
         // Main chain continues: A → B (Alice sends 10 to Charlie)
         let tx2 = alice.create_transaction(charlie.address(), 10);
         let block_b = mine_block(2, block_a_hash, &[tx2], 1);
         let _ = blockchain.add_block(block_b).ok();
+        assert_eq!(
+            blockchain.cumulative_difficulty(),
+            2 + 2 + 2,
+            "After block B"
+        );
 
         // Fork1 from A: A → C (Alice sends 30 to Charlie)
         let tx3 = alice.create_transaction(charlie.address(), 30);
@@ -1102,6 +1106,12 @@ mod tests {
         let block_c_hash = *block_c.hash();
         let result_c = blockchain.add_block(block_c);
         assert!(result_c.is_success(), "Fork C should be created");
+        assert_eq!(blockchain.fork_count(), 1, "Fork1 created");
+        assert_eq!(
+            blockchain.cumulative_difficulty(),
+            2 + 2 + 2,
+            "After fork C added"
+        );
 
         // Fork2 from C: C → E (Bob sends 5 to Charlie)
         // This is the critical branch: E branches from C (which itself is a fork)
@@ -1113,6 +1123,11 @@ mod tests {
             result_e.is_success(),
             "Fork-of-fork branch E should be created from C"
         );
+        assert_eq!(
+            blockchain.cumulative_difficulty(),
+            2 + 2 + 2,
+            "After fork E added"
+        );
 
         // Verify blockchain integrity
         // Same as previous test: longer chain wins
@@ -1122,5 +1137,10 @@ mod tests {
             "Fork-of-fork should become main chain (Genesis + A + C + E)"
         );
         assert_eq!(blockchain.fork_count(), 1, "Old main (B) should be a fork");
+        assert_eq!(
+            blockchain.cumulative_difficulty(),
+            2 + 2 + 2 + 2,
+            "After reorganization to fork-of-fork"
+        );
     }
 }

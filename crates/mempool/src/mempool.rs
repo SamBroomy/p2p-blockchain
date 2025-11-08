@@ -1,8 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use blake3::Hash;
-
-use crate::Transaction;
+use blockchain_types::Transaction;
 
 #[derive(Debug, Clone)]
 pub struct Mempool {
@@ -90,8 +89,9 @@ impl Default for Mempool {
 
 #[cfg(test)]
 mod tests {
+    use blockchain_types::wallet::Wallet;
+
     use super::*;
-    use crate::Wallet;
 
     #[test]
     fn test_mempool_add_transaction() {

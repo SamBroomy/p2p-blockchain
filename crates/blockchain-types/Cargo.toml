@@ -1,0 +1,27 @@
+[package]
+name = "blockchain-types"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+description.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+publish.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+secrecy = { workspace = true }
+rand = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+serde_valid = { workspace = true }
+[dev-dependencies]
+serde_json = { workspace = true }
+[lints]
+workspace = true

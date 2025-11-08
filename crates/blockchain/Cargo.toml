@@ -1,5 +1,5 @@
 [package]
-name = "domain"
+name = "blockchain"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
@@ -12,20 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-
-bytes = { workspace = true }
-chrono = { workspace = true }
 serde = { workspace = true }
+blockchain-types = { workspace = true }
 blake3 = { workspace = true }
-ed25519-dalek = { workspace = true }
-serde_valid = { workspace = true }
-rand = { workspace = true }
-hex = { workspace = true }
-thiserror = { workspace = true }
-secrecy = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

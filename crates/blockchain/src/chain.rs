@@ -1,9 +1,8 @@
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData};
 
 use blake3::Hash;
+use blockchain_types::{Block, GENESIS_ROOT_HASH, Transaction, wallet::Address};
 use serde::{Deserialize, Serialize};
-
-use super::{Address, Block, GENESIS_ROOT_HASH, Transaction};
 
 type Balance = u64;
 type Delta = i64;
@@ -249,6 +248,11 @@ impl<T: ChainType> Chain<T> {
         );
         self.blocks.push(block);
         Ok(())
+    }
+
+    pub fn validate_transaction(&self, tx: &Transaction) -> bool {
+        let sender_balance = self.get_balance(tx.sender()).unwrap_or(INITIAL_BALANCE);
+        sender_balance >= tx.amount()
     }
 }
 
@@ -585,8 +589,9 @@ impl Chain<ForkChain> {
 
 #[cfg(test)]
 mod tests {
+    use blockchain_types::{BlockConstructor, wallet::Wallet};
+
     use super::*;
-    use crate::{BlockConstructor, Wallet};
 
     fn mine_block(
         index: u64,
@@ -992,6 +997,29 @@ mod tests {
         assert!(
             fork.valid_fork(&root),
             "Fork with transactions should be valid even though balances diverge from INITIAL_BALANCE"
+        );
+    }
+
+    #[test]
+    fn test_validate_transaction() {
+        let genesis = mine_block(0, GENESIS_ROOT_HASH, &[], 1);
+        let chain = Chain::<RootChain>::new_from_genesis(genesis.clone());
+
+        let alice = Wallet::from_seed("alice");
+        let bob = Wallet::from_seed("bob");
+
+        // Valid transaction: Alice sends 50 to Bob
+        let tx_valid = alice.create_transaction(bob.address(), 50);
+        assert!(
+            chain.validate_transaction(&tx_valid),
+            "Valid transaction should be accepted"
+        );
+
+        // Invalid transaction: Alice tries to send 150 to Bob (only has 100)
+        let tx_invalid = alice.create_transaction(bob.address(), 150);
+        assert!(
+            !chain.validate_transaction(&tx_invalid),
+            "Invalid transaction should be rejected"
         );
     }
 }

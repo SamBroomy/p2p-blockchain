@@ -4,10 +4,12 @@ use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
 
-use super::Address;
-use crate::blockchain::{GENESIS_ROOT_HASH, wallet::PrivateKey};
+use crate::{
+    GENESIS_ROOT_HASH,
+    wallet::{Address, private_key::PrivateKey},
+};
 
-pub(super) struct TransactionConstructor;
+pub struct TransactionConstructor;
 
 impl TransactionConstructor {
     pub fn new_transaction(
@@ -67,6 +69,10 @@ impl InnerTransaction {
             timestamp: Utc::now(),
         }
     }
+
+    fn is_block_reward(&self) -> bool {
+        utils::is_block_reward(&self.sender)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate, PartialEq, Eq)]
@@ -109,16 +115,9 @@ impl Transaction {
         }
     }
 
-    // Add a validation method that can be called after deserialization
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.is_block_reward() {
-            if !utils::is_valid_block_reward(&self.inner, &self.signature, &self.hash) {
-                return Err("Invalid block reward");
-            }
-        } else if !utils::is_valid_transaction(&self.inner, &self.signature, &self.hash) {
-            return Err("Invalid transaction");
-        }
-        Ok(())
+    // Checks if a transaction is valid (verify signature and hash NOT amount checks)
+    pub fn is_validate(&self) -> bool {
+        utils::is_valid_transaction(&self.inner, &self.signature, &self.hash)
     }
 
     // Add public accessors
@@ -152,7 +151,7 @@ impl Transaction {
 
 mod utils {
     use super::{Address, DateTime, Hash, Hasher, InnerTransaction, Signature, Transaction, Utc};
-    use crate::blockchain::GENESIS_ROOT_HASH;
+    use crate::GENESIS_ROOT_HASH;
 
     #[inline]
     fn hash_transaction_inner_data(
@@ -247,6 +246,9 @@ mod utils {
     ) -> bool {
         *hash == hash_transaction_complete(Hasher::new(), inner, *signature)
     }
+    pub fn is_block_reward(address: &Address) -> bool {
+        address.as_bytes() == GENESIS_ROOT_HASH.as_bytes()
+    }
 
     #[inline]
     pub fn is_valid_transaction(
@@ -254,11 +256,13 @@ mod utils {
         signature: &Signature,
         hash: &Hash,
     ) -> bool {
-        // 1. recreate the message hash without signature
-        // 2. verify the signature
-        is_valid_signature(inner_tx, signature)
-        // 3. verify the transaction hash
-        && is_valid_transaction_hash(hash, inner_tx, signature)
+        if inner_tx.is_block_reward() {
+            is_valid_block_reward(inner_tx, signature, hash)
+        } else {
+            // Regular transaction checks
+            is_valid_signature(inner_tx, signature)
+                && is_valid_transaction_hash(hash, inner_tx, signature)
+        }
     }
 
     #[inline]
@@ -323,7 +327,7 @@ mod tests {
         assert_eq!(tx.sender(), &sender_pk);
         assert_eq!(tx.receiver(), &receiver_pk);
         assert_eq!(tx.amount(), 100);
-        assert!(tx.validate().is_ok());
+        assert!(tx.is_validate());
     }
 
     #[test]
@@ -338,7 +342,7 @@ mod tests {
 
         let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 50, &sender_sk);
 
-        assert!(tx.validate().is_ok());
+        assert!(tx.is_validate());
     }
 
     #[test]
@@ -376,7 +380,7 @@ mod tests {
         assert_eq!(tx.receiver(), deserialized.receiver());
         assert_eq!(tx.amount(), deserialized.amount());
         assert_eq!(tx.hash(), deserialized.hash());
-        assert!(deserialized.validate().is_ok());
+        assert!(deserialized.is_validate());
     }
 
     #[test]
@@ -389,7 +393,7 @@ mod tests {
         assert_eq!(reward.receiver(), &miner_pk);
         assert_eq!(reward.amount(), 50);
         assert_eq!(reward.sender().as_bytes(), GENESIS_ROOT_HASH.as_bytes());
-        assert!(reward.validate().is_ok());
+        assert!(reward.is_validate());
     }
 
     #[test]
@@ -405,6 +409,6 @@ mod tests {
         assert!(deserialized.is_block_reward());
         assert_eq!(reward.receiver(), deserialized.receiver());
         assert_eq!(reward.amount(), deserialized.amount());
-        assert!(deserialized.validate().is_ok());
+        assert!(deserialized.is_validate());
     }
 }

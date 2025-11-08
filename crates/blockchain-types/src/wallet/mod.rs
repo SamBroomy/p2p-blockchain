@@ -1,37 +1,12 @@
-use ed25519_dalek::{Signature, SigningKey, ed25519::signature::SignerMut};
+mod address;
+pub(crate) mod private_key;
+
+pub use address::Address;
+use ed25519_dalek::SigningKey;
+use private_key::PrivateKey;
 use rand::rngs::OsRng;
-use secrecy::{ExposeSecret, SecretSlice};
 
-use crate::blockchain::{Address, Transaction, transaction::TransactionConstructor};
-
-#[derive(Debug, Clone)]
-pub(super) struct PrivateKey(SecretSlice<u8>);
-
-impl PrivateKey {
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        let secret_box = SecretSlice::new(Box::new(bytes));
-        Self(secret_box)
-    }
-
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn from_singing_key(sk: SigningKey) -> Self {
-        Self::from_bytes(sk.to_bytes())
-    }
-
-    fn to_signing_key(&self) -> SigningKey {
-        let bytes: &[u8; 32] = self
-            .0
-            .expose_secret()
-            .try_into()
-            .expect("Invalid key length");
-        SigningKey::from_bytes(bytes)
-    }
-
-    pub fn sign(&self, msg: &[u8]) -> Signature {
-        let mut signing_key = self.to_signing_key();
-        signing_key.sign(msg)
-    }
-}
+use crate::transaction::{Transaction, TransactionConstructor};
 
 #[derive(Debug, Clone)]
 pub struct Wallet {
@@ -130,6 +105,6 @@ mod tests {
         assert_eq!(tx.sender(), sender.address());
         assert_eq!(tx.receiver(), receiver.address());
         assert_eq!(tx.amount(), 100);
-        assert!(tx.validate().is_ok());
+        assert!(tx.is_validate());
     }
 }
