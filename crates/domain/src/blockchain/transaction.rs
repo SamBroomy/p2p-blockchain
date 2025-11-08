@@ -1,18 +1,27 @@
 use blake3::{Hash, Hasher};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey, ed25519::signature::SignerMut};
+use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
 
-pub struct TransactionConstructor;
+use super::Address;
+use crate::blockchain::wallet::PrivateKey;
+
+pub(super) struct TransactionConstructor;
 
 impl TransactionConstructor {
     pub fn new_transaction(
-        sender: &VerifyingKey,
-        receiver: &VerifyingKey,
+        sender: &Address,
+        receiver: &Address,
         amount: u64,
-        sender_private_key: &mut SigningKey,
+        sender_private_key: &PrivateKey,
     ) -> Transaction {
+        debug_assert!(amount > 0, "Transaction amount must be greater than 0");
+        debug_assert_ne!(
+            sender.as_bytes(),
+            receiver.as_bytes(),
+            "Sender and receiver must be different"
+        );
         let inner = InnerTransaction::new(*sender, *receiver, amount);
         // 1. hash the transaction data
         let message_hash = inner.hash();
@@ -27,8 +36,8 @@ impl TransactionConstructor {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct InnerTransaction {
-    sender: VerifyingKey,   // Public key (address)
-    receiver: VerifyingKey, // Public key (address)
+    sender: Address,   // Public key (address)
+    receiver: Address, // Public key (address)
     amount: u64,
     timestamp: DateTime<Utc>,
 }
@@ -38,7 +47,7 @@ impl InnerTransaction {
         utils::hash_inner_transaction(Hasher::new(), self)
     }
 
-    fn new(sender: VerifyingKey, receiver: VerifyingKey, amount: u64) -> Self {
+    fn new(sender: Address, receiver: Address, amount: u64) -> Self {
         Self {
             sender,
             receiver,
@@ -65,7 +74,7 @@ impl Transaction {
     fn new(inner: InnerTransaction, signature: Signature, hash: Hash) -> Self {
         assert!(
             utils::is_valid_transaction(&inner, &signature, &hash),
-            "The transaction hash must match the inner transaction hash and signature in order to create a Transaction."
+            "Transaction must be valid: signature and hash must match inner transaction"
         );
         Self {
             inner,
@@ -83,15 +92,16 @@ impl Transaction {
     }
 
     // Add public accessors
-    pub fn sender(&self) -> &VerifyingKey {
+    pub fn sender(&self) -> &Address {
         &self.inner.sender
     }
 
-    pub fn receiver(&self) -> &VerifyingKey {
+    pub fn receiver(&self) -> &Address {
         &self.inner.receiver
     }
 
     pub fn amount(&self) -> u64 {
+        debug_assert!(self.inner.amount > 0, "Transaction amount must be > 0");
         self.inner.amount
     }
 
@@ -107,15 +117,13 @@ impl Transaction {
 // }
 
 mod utils {
-    use super::{
-        DateTime, Hash, Hasher, InnerTransaction, Signature, Transaction, Utc, Verifier,
-        VerifyingKey,
-    };
+    use super::{Address, DateTime, Hash, Hasher, InnerTransaction, Signature, Transaction, Utc};
+
     #[inline]
     fn hash_transaction_inner_data(
         mut hasher: Hasher,
-        sender: VerifyingKey,
-        receiver: VerifyingKey,
+        sender: Address,
+        receiver: Address,
         amount: u64,
         timestamp: DateTime<Utc>,
     ) -> Hasher {
@@ -129,8 +137,8 @@ mod utils {
     #[inline]
     fn hash_transaction_data(
         hasher: Hasher,
-        sender: VerifyingKey,
-        receiver: VerifyingKey,
+        sender: Address,
+        receiver: Address,
         amount: u64,
         timestamp: DateTime<Utc>,
     ) -> Hash {
@@ -151,8 +159,8 @@ mod utils {
     #[inline]
     fn hash_transaction_inner(
         hasher: Hasher,
-        sender: VerifyingKey,
-        receiver: VerifyingKey,
+        sender: Address,
+        receiver: Address,
         amount: u64,
         timestamp: DateTime<Utc>,
         signature: Signature,
@@ -165,8 +173,8 @@ mod utils {
     #[inline]
     fn hash_transaction(
         hasher: Hasher,
-        sender: VerifyingKey,
-        receiver: VerifyingKey,
+        sender: Address,
+        receiver: Address,
         amount: u64,
         timestamp: DateTime<Utc>,
         signature: Signature,
@@ -234,12 +242,15 @@ mod tests {
 
     #[test]
     fn test_create_valid_transaction() {
-        let mut sender_sk = SigningKey::generate(&mut OsRng);
-        let sender_pk = sender_sk.verifying_key();
-        let receiver_pk = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut csprng = OsRng;
+        let sk = SigningKey::generate(&mut csprng);
+        let sender_pk = Address::from_verifying_key(sk.verifying_key());
+        let sender_sk = PrivateKey::from_singing_key(sk);
 
-        let tx =
-            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, &mut sender_sk);
+        let receiver_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+
+        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, &sender_sk);
 
         assert_eq!(tx.sender(), &sender_pk);
         assert_eq!(tx.receiver(), &receiver_pk);
@@ -249,24 +260,29 @@ mod tests {
 
     #[test]
     fn test_transaction_validation() {
-        let mut sender_sk = SigningKey::generate(&mut OsRng);
-        let sender_pk = sender_sk.verifying_key();
-        let receiver_pk = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut csprng = OsRng;
+        let sk = SigningKey::generate(&mut csprng);
+        let sender_pk = Address::from_verifying_key(sk.verifying_key());
+        let sender_sk = PrivateKey::from_singing_key(sk);
 
-        let tx =
-            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 50, &mut sender_sk);
+        let receiver_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+
+        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 50, &sender_sk);
 
         assert!(tx.validate().is_ok());
     }
 
     #[test]
     fn test_transaction_hash_consistency() {
-        let mut sender_sk = SigningKey::generate(&mut OsRng);
-        let sender_pk = sender_sk.verifying_key();
-        let receiver_pk = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut csprng = OsRng;
+        let sk = SigningKey::generate(&mut csprng);
+        let sender_pk = Address::from_verifying_key(sk.verifying_key());
+        let sender_sk = PrivateKey::from_singing_key(sk);
+        let receiver_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
-        let tx =
-            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 75, &mut sender_sk);
+        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 75, &sender_sk);
         let hash1 = tx.hash();
         let hash2 = tx.hash();
 
@@ -275,12 +291,14 @@ mod tests {
 
     #[test]
     fn test_transaction_serialization_roundtrip() {
-        let mut sender_sk = SigningKey::generate(&mut OsRng);
-        let sender_pk = sender_sk.verifying_key();
-        let receiver_pk = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut csprng = OsRng;
+        let sk = SigningKey::generate(&mut csprng);
+        let sender_pk = Address::from_verifying_key(sk.verifying_key());
+        let sender_sk = PrivateKey::from_singing_key(sk);
+        let receiver_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
-        let tx =
-            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 123, &mut sender_sk);
+        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 123, &sender_sk);
 
         let serialized = serde_json::to_string(&tx).expect("serialization failed");
         let deserialized: Transaction =

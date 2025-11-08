@@ -29,13 +29,15 @@ categories = ["Cryptocurrency"]
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 bytes = { version = "1", features = ["serde"] }
-chrono = { version = "0.4.42", features = ["serde"] }
-blake3 = { version = "1.8.2", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+blake3 = { version = "1.8", features = ["serde"] }
 ed25519-dalek = { version = "2.2", features = ["serde", "rand_core"] }
-serde_valid = "2.0.0"
-rand = { version = "0.8.0" }
+serde_valid = "2.0"
+rand = { version = "0.8" }
 serde_json = { version = "1" }
-indexmap = "2.12.0"
+hex = { version = "0.4", features = ["serde"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
+thiserror = "2.0"
 domain = { path = "crates/domain" }
 
 [workspace.lints.clippy]

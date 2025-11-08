@@ -20,7 +20,9 @@ blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 serde_valid = { workspace = true }
 rand = { workspace = true }
-indexmap = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+secrecy = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

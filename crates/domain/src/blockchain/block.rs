@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
 
-use crate::transaction::Transaction;
+use super::Transaction;
 
 #[derive(Debug, Clone)]
 pub struct BlockConstructor {
@@ -15,6 +15,10 @@ pub struct BlockConstructor {
 
 impl BlockConstructor {
     pub fn new(index: u64, transactions: &[Transaction], previous_hash: Hash) -> Self {
+        debug_assert!(
+            transactions.iter().all(|tx| tx.validate().is_ok()),
+            "All transactions must be valid before mining"
+        );
         let mut hasher = Hasher::new();
 
         hasher = utils::hash_initial(hasher, index, &previous_hash, transactions);
@@ -28,6 +32,10 @@ impl BlockConstructor {
     }
 
     pub fn mine(self, difficulty: usize, initial_nonce: impl Into<Option<u64>>) -> Block {
+        debug_assert!(
+            difficulty <= 64,
+            "Difficulty {difficulty} exceeds maximum possible value of 64"
+        );
         let mut nonce = initial_nonce.into().unwrap_or(0);
         loop {
             let hasher = self.hash_state.clone();
@@ -38,6 +46,10 @@ impl BlockConstructor {
                     BlockInner::new(self.index, self.transactions, self.previous_hash, nonce);
                 return Block::new(inner, hash, difficulty);
             }
+            debug_assert!(
+                nonce != u64::MAX,
+                "Nonce wrapped around - no valid hash found with difficulty {difficulty}"
+            );
             nonce = nonce.wrapping_add(1);
         }
     }
@@ -92,11 +104,16 @@ impl Block {
     fn new(inner: BlockInner, hash: Hash, difficulty: usize) -> Self {
         assert!(
             utils::is_valid_inner_block(&inner, difficulty),
-            "The inner block must be valid in order to create a Block."
+            "Block must meet difficulty target: difficulty={difficulty}, hash={hash:?}"
         );
         assert!(
             utils::is_valid_block_hash(&hash, &inner),
-            "The block hash must match the inner block hash in order to create a Block."
+            "Block hash {hash:?} must match computed hash {:?}",
+            inner.hash()
+        );
+        debug_assert!(
+            inner.transactions.iter().all(|tx| tx.validate().is_ok()),
+            "All transactions in block must be valid"
         );
         Self {
             inner,
@@ -125,6 +142,11 @@ impl Block {
     }
 
     pub fn difficulty(&self) -> usize {
+        debug_assert!(
+            self.difficulty <= 64,
+            "Difficulty {} exceeds maximum",
+            self.difficulty
+        );
         self.difficulty
     }
 
@@ -172,11 +194,21 @@ mod utils {
 
     #[inline]
     pub fn is_valid_target_hash(hash: &Hash, difficulty: usize) -> bool {
+        // Blake3 produces 32-byte (256-bit) hashes = 64 hex digits maximum
+        // Difficulties > 64 are impossible to satisfy
+        if difficulty > 64 {
+            return false;
+        }
+
         let bytes = hash.as_bytes();
 
         // The hash is a hex string, so each byte represents two hex digits.
         let full_zeros = difficulty / 2; // Number of complete zero bytes
         let partial_zero = difficulty % 2; // Remaining hex digit
+        debug_assert!(
+            full_zeros <= 32,
+            "Full zeros {full_zeros} cannot exceed 32 bytes"
+        );
 
         for byte in bytes.iter().take(full_zeros) {
             // Check complete zero bytes
@@ -185,9 +217,12 @@ mod utils {
                 return false;
             }
         }
-        if partial_zero > 0 && bytes[full_zeros] >> 4 != 0 {
-            // Check remaining hex digit (upper nibble of the next byte)
-            return false;
+        if partial_zero > 0 {
+            debug_assert!(full_zeros < 32, "Cannot check partial zero beyond 32 bytes");
+            if bytes[full_zeros] >> 4 != 0 {
+                // Check remaining hex digit (upper nibble of the next byte)
+                return false;
+            }
         }
         true
     }
@@ -220,6 +255,7 @@ mod utils {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Wallet;
 
     #[test]
     fn test_mine_block_with_zero_difficulty() {
@@ -253,9 +289,7 @@ mod tests {
 
     #[test]
     fn test_block_with_transactions() {
-        use crate::wallet::Wallet;
-
-        let mut wallet1 = Wallet::new();
+        let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
         let tx = wallet1.create_transaction(wallet2.address(), 50);
 
