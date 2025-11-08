@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
 
 use super::Address;
-use crate::blockchain::wallet::PrivateKey;
+use crate::blockchain::{GENESIS_ROOT_HASH, wallet::PrivateKey};
 
 pub(super) struct TransactionConstructor;
 
@@ -29,8 +29,20 @@ impl TransactionConstructor {
         let signature = sender_private_key.sign(message_hash.as_bytes());
         // 3. compute the final transaction hash including the signature
         let transaction_hash = utils::hash_transaction_complete(Hasher::new(), &inner, signature);
-
         Transaction::new(inner, signature, transaction_hash)
+    }
+
+    pub(super) fn block_reward(miner_address: &Address, amount: u64) -> Transaction {
+        debug_assert!(amount > 0, "Block reward amount must be greater than 0");
+        let genesis_address = Address::from_bytes(GENESIS_ROOT_HASH.as_bytes())
+            .expect("Failed to create genesis address");
+        let inner = InnerTransaction::new(genesis_address, *miner_address, amount);
+        // Block rewards use a dummy signature (all zeros)
+        let dummy_signature = Signature::from_bytes(&[0u8; 64]);
+        // Hash includes the dummy signature
+        let transaction_hash =
+            utils::hash_transaction_complete(Hasher::new(), &inner, dummy_signature);
+        Transaction::new_block_reward(inner, dummy_signature, transaction_hash)
     }
 }
 
@@ -83,9 +95,27 @@ impl Transaction {
         }
     }
 
+    /// Create a block reward transaction (internal use only)
+    /// Block rewards don't require signature validation since they create new coins
+    fn new_block_reward(inner: InnerTransaction, signature: Signature, hash: Hash) -> Self {
+        assert!(
+            utils::is_valid_block_reward(&inner, &signature, &hash),
+            "Block reward must be valid: must use genesis sender and correct hash"
+        );
+        Self {
+            inner,
+            signature,
+            hash,
+        }
+    }
+
     // Add a validation method that can be called after deserialization
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !utils::is_valid_transaction(&self.inner, &self.signature, &self.hash) {
+        if self.is_block_reward() {
+            if !utils::is_valid_block_reward(&self.inner, &self.signature, &self.hash) {
+                return Err("Invalid block reward");
+            }
+        } else if !utils::is_valid_transaction(&self.inner, &self.signature, &self.hash) {
             return Err("Invalid transaction");
         }
         Ok(())
@@ -108,6 +138,10 @@ impl Transaction {
     pub fn timestamp(&self) -> DateTime<Utc> {
         self.inner.timestamp
     }
+
+    pub fn is_block_reward(&self) -> bool {
+        self.inner.sender.as_bytes() == GENESIS_ROOT_HASH.as_bytes()
+    }
 }
 
 // Ignore block reward for now
@@ -118,6 +152,7 @@ impl Transaction {
 
 mod utils {
     use super::{Address, DateTime, Hash, Hasher, InnerTransaction, Signature, Transaction, Utc};
+    use crate::blockchain::GENESIS_ROOT_HASH;
 
     #[inline]
     fn hash_transaction_inner_data(
@@ -205,7 +240,11 @@ mod utils {
     }
 
     #[inline]
-    fn is_valid_block_hash(hash: &Hash, inner: &InnerTransaction, signature: &Signature) -> bool {
+    fn is_valid_transaction_hash(
+        hash: &Hash,
+        inner: &InnerTransaction,
+        signature: &Signature,
+    ) -> bool {
         *hash == hash_transaction_complete(Hasher::new(), inner, *signature)
     }
 
@@ -219,11 +258,40 @@ mod utils {
         // 2. verify the signature
         is_valid_signature(inner_tx, signature)
         // 3. verify the transaction hash
-        && is_valid_block_hash(hash, inner_tx, signature)
+        && is_valid_transaction_hash(hash, inner_tx, signature)
+    }
+
+    #[inline]
+    pub fn is_valid_block_reward(
+        inner_tx: &InnerTransaction,
+        signature: &Signature,
+        hash: &Hash,
+    ) -> bool {
+        // Block rewards must:
+        // 1. Have genesis as sender
+        if inner_tx.sender.as_bytes() != GENESIS_ROOT_HASH.as_bytes() {
+            return false;
+        }
+
+        // 2. Have dummy signature (all zeros)
+        if signature.to_bytes() != [0u8; 64] {
+            return false;
+        }
+
+        // 3. Have correct hash
+        is_valid_transaction_hash(hash, inner_tx, signature)
     }
 
     pub fn validate_transaction(tx: &Transaction) -> Result<(), serde_valid::validation::Error> {
-        if is_valid_transaction(&tx.inner, &tx.signature, &tx.hash) {
+        if tx.is_block_reward() {
+            if is_valid_block_reward(&tx.inner, &tx.signature, &tx.hash) {
+                Ok(())
+            } else {
+                Err(serde_valid::validation::Error::Custom(
+                    "Invalid block reward".to_owned(),
+                ))
+            }
+        } else if is_valid_transaction(&tx.inner, &tx.signature, &tx.hash) {
             Ok(())
         } else {
             Err(serde_valid::validation::Error::Custom(
@@ -308,6 +376,35 @@ mod tests {
         assert_eq!(tx.receiver(), deserialized.receiver());
         assert_eq!(tx.amount(), deserialized.amount());
         assert_eq!(tx.hash(), deserialized.hash());
+        assert!(deserialized.validate().is_ok());
+    }
+
+    #[test]
+    fn test_block_reward_creation() {
+        let miner_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+        let reward = TransactionConstructor::block_reward(&miner_pk, 50);
+
+        assert!(reward.is_block_reward());
+        assert_eq!(reward.receiver(), &miner_pk);
+        assert_eq!(reward.amount(), 50);
+        assert_eq!(reward.sender().as_bytes(), GENESIS_ROOT_HASH.as_bytes());
+        assert!(reward.validate().is_ok());
+    }
+
+    #[test]
+    fn test_block_reward_serialization() {
+        let miner_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+        let reward = TransactionConstructor::block_reward(&miner_pk, 50);
+
+        let serialized = serde_json::to_string(&reward).expect("serialization failed");
+        let deserialized: Transaction =
+            serde_json::from_str(&serialized).expect("deserialization failed");
+
+        assert!(deserialized.is_block_reward());
+        assert_eq!(reward.receiver(), deserialized.receiver());
+        assert_eq!(reward.amount(), deserialized.amount());
         assert!(deserialized.validate().is_ok());
     }
 }

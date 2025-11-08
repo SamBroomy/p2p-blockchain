@@ -594,7 +594,7 @@ mod tests {
         transactions: &[Transaction],
         difficulty: usize,
     ) -> Block {
-        BlockConstructor::new(index, transactions, previous_hash).mine(difficulty, None)
+        BlockConstructor::new(index, transactions, previous_hash, None).mine(difficulty, None)
     }
 
     #[test]

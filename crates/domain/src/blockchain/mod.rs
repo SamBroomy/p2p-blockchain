@@ -83,7 +83,7 @@ pub struct BlockChain {
 
 impl BlockChain {
     fn create_genesis_block(difficulty: usize) -> Block {
-        BlockConstructor::new(0, &[], GENESIS_ROOT_HASH).mine(difficulty, None)
+        BlockConstructor::new(0, &[], GENESIS_ROOT_HASH, None).mine(difficulty, None)
     }
 
     pub fn new(difficulty: usize) -> Self {
@@ -390,7 +390,7 @@ mod tests {
         transactions: &[Transaction],
         difficulty: usize,
     ) -> Block {
-        BlockConstructor::new(index, transactions, previous_hash).mine(difficulty, None)
+        BlockConstructor::new(index, transactions, previous_hash, None).mine(difficulty, None)
     }
 
     #[test]

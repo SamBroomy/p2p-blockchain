@@ -1,31 +1,75 @@
+use std::collections::VecDeque;
+
 use blake3::{Hash, Hasher};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
 
 use super::Transaction;
+use crate::blockchain::{Address, transaction::TransactionConstructor};
 
 #[derive(Debug, Clone)]
 pub struct BlockConstructor {
     index: u64,
-    transactions: Vec<Transaction>,
+    transactions: VecDeque<Transaction>,
     previous_hash: Hash,
     hash_state: Hasher,
 }
 
 impl BlockConstructor {
-    pub fn new(index: u64, transactions: &[Transaction], previous_hash: Hash) -> Self {
+    pub const MAX_TRANSACTIONS: usize = 64;
+
+    /// Create a new block constructor
+    /// If `miner_address` is provided, a block reward transaction will be prepended
+    pub fn new(
+        index: u64,
+        transactions: &[Transaction],
+        previous_hash: Hash,
+        miner_address: Option<Address>,
+    ) -> Self {
+        let max_tx = if miner_address.is_some() {
+            Self::MAX_TRANSACTIONS - 1
+        } else {
+            Self::MAX_TRANSACTIONS
+        };
+        debug_assert!(
+            transactions.len() <= max_tx,
+            "Number of transactions {} exceeds maximum allowed {}",
+            transactions.len(),
+            max_tx
+        );
         debug_assert!(
             transactions.iter().all(|tx| tx.validate().is_ok()),
             "All transactions must be valid before mining"
         );
-        let mut hasher = Hasher::new();
+        let mut all_transactions = Vec::new();
 
-        hasher = utils::hash_initial(hasher, index, &previous_hash, transactions);
+        // Prepend block reward if miner address provided
+        if let Some(miner_addr) = miner_address {
+            let reward_tx = TransactionConstructor::block_reward(&miner_addr, 50);
+            debug_assert!(
+                reward_tx.validate().is_ok(),
+                "Block reward transaction must be valid"
+            );
+            all_transactions.push(reward_tx);
+        }
+
+        // Add user transactions
+        all_transactions.extend_from_slice(transactions);
+
+        debug_assert!(
+            all_transactions.len() <= Self::MAX_TRANSACTIONS,
+            "Total transactions {} exceed maximum {}",
+            all_transactions.len(),
+            Self::MAX_TRANSACTIONS
+        );
+
+        let mut hasher = Hasher::new();
+        hasher = utils::hash_initial(hasher, index, &previous_hash, &all_transactions);
 
         Self {
             index,
-            transactions: transactions.to_vec(),
+            transactions: all_transactions.into(),
             previous_hash,
             hash_state: hasher,
         }
@@ -42,8 +86,12 @@ impl BlockConstructor {
             let hash = utils::hash_with_nonce(hasher, nonce);
 
             if utils::is_valid_target_hash(&hash, difficulty) {
-                let inner =
-                    BlockInner::new(self.index, self.transactions, self.previous_hash, nonce);
+                let inner = BlockInner::new(
+                    self.index,
+                    self.transactions.into(),
+                    self.previous_hash,
+                    nonce,
+                );
                 return Block::new(inner, hash, difficulty);
             }
             debug_assert!(
@@ -115,6 +163,17 @@ impl Block {
             inner.transactions.iter().all(|tx| tx.validate().is_ok()),
             "All transactions in block must be valid"
         );
+        // Validate block reward structure if present
+        if !inner.transactions.is_empty() && inner.transactions[0].is_block_reward() {
+            debug_assert!(
+                inner
+                    .transactions
+                    .iter()
+                    .skip(1)
+                    .all(|tx| !tx.is_block_reward()),
+                "Only first transaction can be block reward"
+            );
+        }
         Self {
             inner,
             timestamp: Utc::now(),
@@ -260,7 +319,7 @@ mod tests {
     #[test]
     fn test_mine_block_with_zero_difficulty() {
         let previous_hash = Hash::from_bytes([0u8; 32]);
-        let constructor = BlockConstructor::new(0, &[], previous_hash);
+        let constructor = BlockConstructor::new(0, &[], previous_hash, None);
         let block = constructor.mine(0, None);
 
         assert!(block.is_valid());
@@ -270,7 +329,7 @@ mod tests {
     #[test]
     fn test_mine_block_with_difficulty() {
         let previous_hash = Hash::from_bytes([0u8; 32]);
-        let constructor = BlockConstructor::new(0, &[], previous_hash);
+        let constructor = BlockConstructor::new(0, &[], previous_hash, None);
         let block = constructor.mine(2, None);
 
         assert!(block.is_valid());
@@ -281,7 +340,7 @@ mod tests {
     #[test]
     fn test_block_hash_matches() {
         let previous_hash = Hash::from_bytes([1u8; 32]);
-        let constructor = BlockConstructor::new(1, &[], previous_hash);
+        let constructor = BlockConstructor::new(1, &[], previous_hash, None);
         let block = constructor.mine(1, None);
 
         assert_eq!(block.hash(), &block.inner.hash());
@@ -294,7 +353,7 @@ mod tests {
         let tx = wallet1.create_transaction(wallet2.address(), 50);
 
         let previous_hash = Hash::from_bytes([0u8; 32]);
-        let constructor = BlockConstructor::new(0, &[tx], previous_hash);
+        let constructor = BlockConstructor::new(0, &[tx], previous_hash, None);
         let block = constructor.mine(1, None);
 
         assert!(block.is_valid());
@@ -303,7 +362,7 @@ mod tests {
     #[test]
     fn test_block_serialization() {
         let previous_hash = Hash::from_bytes([0u8; 32]);
-        let constructor = BlockConstructor::new(0, &[], previous_hash);
+        let constructor = BlockConstructor::new(0, &[], previous_hash, None);
         let block = constructor.mine(1, None);
 
         let serialized = serde_json::to_string(&block).expect("serialization failed");
@@ -313,5 +372,120 @@ mod tests {
         assert_eq!(block.hash(), deserialized.hash());
         assert_eq!(block.previous_hash(), deserialized.previous_hash());
         assert!(deserialized.is_valid());
+    }
+
+    #[test]
+    fn test_block_with_miner_reward() {
+        let previous_hash = Hash::from_bytes([0u8; 32]);
+        let miner_wallet = Wallet::new();
+
+        let constructor =
+            BlockConstructor::new(0, &[], previous_hash, Some(*miner_wallet.address()));
+        let block = constructor.mine(1, None);
+
+        assert!(block.is_valid());
+        assert_eq!(
+            block.transactions().len(),
+            1,
+            "Block should contain block reward transaction"
+        );
+
+        let reward_tx = &block.transactions()[0];
+        assert!(
+            reward_tx.is_block_reward(),
+            "First transaction should be block reward"
+        );
+        assert_eq!(
+            reward_tx.receiver(),
+            miner_wallet.address(),
+            "Reward should go to miner"
+        );
+        assert_eq!(reward_tx.amount(), 50, "Block reward should be 50");
+        assert!(
+            reward_tx.validate().is_ok(),
+            "Block reward transaction should be valid"
+        );
+    }
+
+    #[test]
+    fn test_block_with_miner_and_transactions() {
+        let previous_hash = Hash::from_bytes([0u8; 32]);
+        let miner_wallet = Wallet::new();
+        let wallet1 = Wallet::new();
+        let wallet2 = Wallet::new();
+
+        let tx1 = wallet1.create_transaction(wallet2.address(), 25);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 15);
+
+        let constructor = BlockConstructor::new(
+            0,
+            &[tx1.clone(), tx2.clone()],
+            previous_hash,
+            Some(*miner_wallet.address()),
+        );
+        let block = constructor.mine(1, None);
+
+        assert!(block.is_valid());
+        assert_eq!(
+            block.transactions().len(),
+            3,
+            "Block should contain 2 user transactions + 1 block reward"
+        );
+
+        let reward_tx = &block.transactions()[0];
+        assert!(
+            reward_tx.is_block_reward(),
+            "First transaction should be block reward"
+        );
+        assert_eq!(
+            reward_tx.receiver(),
+            miner_wallet.address(),
+            "Reward should go to miner"
+        );
+        assert_eq!(reward_tx.amount(), 50, "Block reward should be 50");
+
+        assert_eq!(
+            block.transactions()[1].hash(),
+            tx1.hash(),
+            "Second transaction should be tx1"
+        );
+        assert_eq!(
+            block.transactions()[2].hash(),
+            tx2.hash(),
+            "Third transaction should be tx2"
+        );
+    }
+
+    #[test]
+    fn test_block_with_max_transactions_and_miner() {
+        let previous_hash = Hash::from_bytes([0u8; 32]);
+        let miner_wallet = Wallet::new();
+        let wallet1 = Wallet::new();
+        let wallet2 = Wallet::new();
+
+        let mut transactions = Vec::new();
+        for _ in 0..(BlockConstructor::MAX_TRANSACTIONS - 1) {
+            transactions.push(wallet1.create_transaction(wallet2.address(), 1));
+        }
+
+        let constructor = BlockConstructor::new(
+            0,
+            &transactions,
+            previous_hash,
+            Some(*miner_wallet.address()),
+        );
+        let block = constructor.mine(1, None);
+
+        assert!(block.is_valid());
+        assert_eq!(
+            block.transactions().len(),
+            BlockConstructor::MAX_TRANSACTIONS,
+            "Block should contain MAX_TRANSACTIONS (user txs + block reward)"
+        );
+
+        assert!(
+            block.transactions()[0].is_block_reward(),
+            "First transaction must be block reward"
+        );
     }
 }
