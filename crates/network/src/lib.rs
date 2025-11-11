@@ -3,7 +3,8 @@ mod config;
 mod messages;
 
 pub use behaviour::{
-    BlockchainBehaviour, BlockchainBehaviourEvent, TOPIC_BLOCKS, TOPIC_SYNC, TOPIC_TRANSACTIONS,
+    BlockchainBehaviour, BlockchainBehaviourEvent, SyncRequest, SyncResponse, TOPIC_BLOCKS,
+    TOPIC_TRANSACTIONS,
 };
 pub use config::NetworkConfig;
 // Re-export libp2p types that consumers will need

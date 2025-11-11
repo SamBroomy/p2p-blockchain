@@ -2,15 +2,6 @@
 [workspace]
 members = ["crates/*"]
 resolver = "3"
-# Add this section
-[package]
-name = "p2p-blockchain"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-serde_json = { workspace = true }
-
 
 [workspace.package]
 version = "0.1.0"
@@ -46,6 +37,8 @@ libp2p = { version = "0.56", features = [
     "tcp",
     "yamux",
     "quic",
+    "request-response",
+    "json",
 ] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

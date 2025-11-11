@@ -19,5 +19,6 @@ blockchain-types = { workspace = true }
 libp2p = { workspace = true }
 blake3 = { workspace = true }
 tokio = { workspace = true, features = ["io-std"] }
+rand = { workspace = true }
 [lints]
 workspace = true

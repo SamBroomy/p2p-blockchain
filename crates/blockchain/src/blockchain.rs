@@ -368,6 +368,38 @@ impl BlockChain {
         self.main_chain.tip_hash()
     }
 
+    /// Get a block by its hash (if we have it)
+    pub fn get_block(&self, hash: &Hash) -> Option<&Block> {
+        self.main_chain
+            .blocks()
+            .iter()
+            .find(|b| b.hash() == hash)
+            .or_else(|| {
+                self.forks
+                    .iter()
+                    .find_map(|fork| fork.blocks().iter().find(|b| b.hash() == hash))
+            })
+    }
+
+    /// Get blocks in a height range
+    pub fn get_blocks_in_range(&self, from: u64, to: u64) -> Vec<Block> {
+        self.main_chain
+            .blocks()
+            .iter()
+            .filter(|b| {
+                let idx = b.index();
+                idx >= from && idx <= to
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Get current chain height
+    pub fn height(&self) -> u64 {
+        self.main_chain_len() as u64
+    }
+
+    /// Get cumulative difficulty (already exists)
     pub fn cumulative_difficulty(&self) -> u128 {
         self.main_chain.cumulative_difficulty()
     }

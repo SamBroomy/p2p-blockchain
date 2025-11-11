@@ -1,4 +1,3 @@
-use blake3::Hash;
 use blockchain_types::{Block, Transaction};
 use serde::{Deserialize, Serialize};
 
@@ -10,24 +9,6 @@ pub enum NetworkMessage {
     Transaction(Transaction),
     /// New mined block
     Block(Block),
-    /// Request specific blocks by hash (for syncing orphans)
-    RequestBlocks(Vec<Hash>),
-
-    /// Response with requested blocks
-    ResponseBlocks(Vec<Block>),
-
-    /// Request blocks from a specific height
-    RequestBlockRange { from_height: u64, to_height: u64 },
-    /// Response with blocks in range
-    ResponseBlockRange(Vec<Block>),
-    /// Request status (height, tip hash, difficulty)
-    RequestStatus,
-    /// Respond with current chain status
-    ResponseStatus {
-        chain_height: u64,
-        tip_hash: Hash,
-        cumulative_difficulty: u128,
-    },
 }
 impl NetworkMessage {
     /// Serialize to JSON bytes for gossipsub
