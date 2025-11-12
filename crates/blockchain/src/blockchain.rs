@@ -479,8 +479,8 @@ mod tests {
 
     #[test]
     fn test_const_miner_with_helper() {
-        let blockchain = BlockChain::<Miner<8>>::new_miner();
-        assert_eq!(blockchain.difficulty, 8);
+        let blockchain = BlockChain::<Miner<5>>::new_miner();
+        assert_eq!(blockchain.difficulty, 5);
     }
 
     fn mine_block(
@@ -1194,6 +1194,7 @@ mod tests {
         let block_a_hash = *block_a.hash();
         let _ = blockchain.add_block(block_a).ok();
         assert_eq!(blockchain.cumulative_difficulty(), 2 + 2, "After block A");
+        assert_eq!(blockchain.main_chain_len(), 2, "Genesis + A");
 
         // Main chain continues: A → B (Alice sends 10 to Charlie)
         let tx2 = alice.create_transaction(charlie.address(), 10);
@@ -1204,6 +1205,7 @@ mod tests {
             2 + 2 + 2,
             "After block B"
         );
+        assert_eq!(blockchain.main_chain_len(), 3, "Genesis + A + B");
 
         // Fork1 from A: A → C (Alice sends 30 to Charlie)
         let tx3 = alice.create_transaction(charlie.address(), 30);
@@ -1215,11 +1217,16 @@ mod tests {
         assert_eq!(
             blockchain.cumulative_difficulty(),
             2 + 2 + 2,
-            "After fork C added"
+            "Main chain unchanged after fork C added"
         );
+        assert_eq!(blockchain.main_chain_len(), 3, "Still Genesis + A + B");
 
         // Fork2 from C: C → E (Bob sends 5 to Charlie)
         // This is the critical branch: E branches from C (which itself is a fork)
+        // Cumulative difficulty calculation:
+        // - Main chain (Genesis + A + B): 2 + 2 + 2 = 6
+        // - Fork chain (Genesis + A + C + E): 2 + 2 + 2 + 2 = 8
+        // Fork chain has higher difficulty, so reorganization will occur
         let bob_wallet = Wallet::from_seed("bob");
         let tx4 = bob_wallet.create_transaction(charlie.address(), 5);
         let block_e = mine_block(3, block_c_hash, &[tx4], 1);
@@ -1228,24 +1235,19 @@ mod tests {
             result_e.is_success(),
             "Fork-of-fork branch E should be created from C"
         );
+
+        // After adding E, reorganization should happen immediately
+        // because fork chain (8) > main chain (6)
         assert_eq!(
             blockchain.cumulative_difficulty(),
-            2 + 2 + 2,
-            "After fork E added"
+            2 + 2 + 2 + 2,
+            "After reorganization to fork-of-fork (Genesis + A + C + E)"
         );
-
-        // Verify blockchain integrity
-        // Same as previous test: longer chain wins
         assert_eq!(
             blockchain.main_chain_len(),
             4,
             "Fork-of-fork should become main chain (Genesis + A + C + E)"
         );
         assert_eq!(blockchain.fork_count(), 1, "Old main (B) should be a fork");
-        assert_eq!(
-            blockchain.cumulative_difficulty(),
-            2 + 2 + 2 + 2,
-            "After reorganization to fork-of-fork"
-        );
     }
 }
