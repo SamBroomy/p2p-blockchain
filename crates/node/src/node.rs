@@ -2,7 +2,10 @@ use std::{collections::HashMap, error::Error, time::Duration};
 
 use blake3::Hash;
 use blockchain::{BlockAddResult, BlockChain};
-use blockchain_types::{Block, Transaction, wallet::Wallet};
+use blockchain_types::{
+    Block, BlockConstructor, Miner, Transaction,
+    wallet::{Address, Wallet},
+};
 use libp2p::{
     PeerId,
     futures::StreamExt,
@@ -11,16 +14,17 @@ use libp2p::{
 };
 use mempool::Mempool;
 use network::{
-    BlockchainBehaviour, NetworkMessage, Swarm, SwarmEvent, SyncRequest, SyncResponse,
-    TOPIC_BLOCKS, TOPIC_TRANSACTIONS,
+    BlockchainBehaviour, BlockchainBehaviourEvent, NetworkMessage, Swarm, SwarmEvent, SyncRequest,
+    SyncResponse, TOPIC_BLOCKS, TOPIC_TRANSACTIONS,
 };
 use tokio::{io, io::AsyncBufReadExt};
+use tracing::{debug, info, warn};
 
 pub struct Node {
-    blockchain: BlockChain,
-    mempool: Mempool,
+    pub blockchain: BlockChain<Miner<5>>,
+    pub mempool: Mempool,
     wallet: Wallet,
-    swarm: Swarm<BlockchainBehaviour>,
+    pub swarm: Swarm<BlockchainBehaviour>,
     // Trackpending requests (for responses)
     pending_requests: HashMap<OutboundRequestId, SyncRequestType>,
 }
@@ -41,7 +45,7 @@ impl Node {
                 libp2p::noise::Config::new,
                 libp2p::yamux::Config::default,
             )?
-            .with_quic()
+            // .with_quic()
             .with_behaviour(|key| Ok(BlockchainBehaviour::new(key)?))?
             .build();
 
@@ -49,11 +53,13 @@ impl Node {
         swarm.behaviour_mut().subscribe_to_topics()?;
 
         // Listen on all interfaces
-        swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+        // swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
         swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
+        let blockchain: BlockChain<Miner<5>> = BlockChain::<Miner<5>>::new_miner();
+
         Ok(Self {
-            blockchain: BlockChain::new(4), // difficulty 4
+            blockchain,
             mempool: Mempool::new(),
             wallet,
             swarm,
@@ -64,6 +70,7 @@ impl Node {
 
     /// Main event loop
     pub async fn run(&mut self) {
+        // TODO: on startup, get the blockchain state from peers (first sync)
         // Read full lines from stdin
         let mut _stdin = io::BufReader::new(io::stdin()).lines();
 
@@ -76,65 +83,69 @@ impl Node {
                     self.sync_check();
                 }
                 event = self.swarm.select_next_some() => {
-                    match event {
-                        // New listening address
-                        SwarmEvent::NewListenAddr { address, .. } => {
-                            println!("📡 Listening on {address}");
+                    self.handle_swarm_event(event);
+
+                }
+            }
+        }
+    }
+
+    pub fn handle_swarm_event(&mut self, event: SwarmEvent<BlockchainBehaviourEvent>) {
+        match event {
+            // New listening address
+            SwarmEvent::NewListenAddr { address, .. } => {
+                info!(address = %address, "Listening on new address");
+            }
+
+            // mDNS discovered a peer
+            SwarmEvent::Behaviour(event) => {
+                use network::BlockchainBehaviourEvent;
+
+                match event {
+                    BlockchainBehaviourEvent::Mdns(mdns::Event::Discovered(peers)) => {
+                        for (peer_id, _) in peers {
+                            debug!(peer_id = %peer_id, "mDNS discovered a new peer");
+                            self.swarm.behaviour_mut().add_peer(&peer_id);
                         }
+                    }
 
-                        // mDNS discovered a peer
-                        SwarmEvent::Behaviour(event) => {
-                            use network::BlockchainBehaviourEvent;
-
-                            match event {
-                                BlockchainBehaviourEvent::Mdns(mdns::Event::Discovered(peers)) => {
-                                    for (peer_id, _) in peers {
-                                        println!("mDNS discovered a new peer: {peer_id}");
-                                        self.swarm.behaviour_mut()
-                                        .add_peer(&peer_id);
-                                    }
-                                }
-
-                                BlockchainBehaviourEvent::Mdns(mdns::Event::Expired(peers)) => {
-                                    for (peer_id, _) in peers {
-                                        println!("mDNS discover peer has expired: {peer_id}");
-                                        self.swarm.behaviour_mut().remove_peer(&peer_id);
-                                    }
-                                }
-
-                                BlockchainBehaviourEvent::Gossipsub(
-                                    gossipsub::Event::Message {
-                                        propagation_source: peer_id,
-                                        message_id: id,
-                                        message,
-                                    },
-                                ) => {
-                                    println!(
-                                        "Got message: '{}' with id: {id} from peer: {peer_id}",
-                                        String::from_utf8_lossy(&message.data),
-                                    );
-                                    // Deserialize and handle message
-                                    if let Ok(msg) = NetworkMessage::from_bytes(&message.data) {
-                                        self.handle_network_message(msg);
-                                    }
-                                }
-                                BlockchainBehaviourEvent::RequestResponse(
-                                    request_response::Event::Message { peer, connection_id, message  },
-                                ) => {
-                                    println!("Received request response message from peer {peer} with connection id {connection_id}");
-                                    // Handle incoming request
-                                    self.handle_request_response_message(message);
-                                }
-                                _ => {
-                                    // debug!("Unhandled behaviour event: {:?}", event);
-                                }
-                            }
+                    BlockchainBehaviourEvent::Mdns(mdns::Event::Expired(peers)) => {
+                        for (peer_id, _) in peers {
+                            debug!(peer_id = %peer_id, "mDNS peer has expired");
+                            self.swarm.behaviour_mut().remove_peer(&peer_id);
                         }
+                    }
 
-                        _ => {}
+                    BlockchainBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                        propagation_source: peer_id,
+                        message_id: id,
+                        message,
+                    }) => {
+                        debug!(peer_id = %peer_id, id = %id, "Gossipsub message received");
+                        debug!(message = %String::from_utf8_lossy(&message.data), "Gossipsub message data");
+                        // Deserialize and handle message
+                        if let Ok(msg) = NetworkMessage::from_bytes(&message.data) {
+                            self.handle_network_message(msg);
+                        }
+                    }
+                    BlockchainBehaviourEvent::RequestResponse(
+                        request_response::Event::Message {
+                            peer,
+                            connection_id,
+                            message,
+                        },
+                    ) => {
+                        debug!(peer = %peer, connection_id = %connection_id, "RequestResponse message received");
+                        // Handle incoming request
+                        self.handle_request_response_message(message);
+                    }
+                    _ => {
+                        // debug!("Unhandled behaviour event: {:?}", event);
                     }
                 }
             }
+
+            _ => {}
         }
     }
 
@@ -169,15 +180,24 @@ impl Node {
     ) {
         let response = match request {
             SyncRequest::Status => {
-                println!("Peer requested our status");
-                SyncResponse::Status {
+                info!("Peer requested our status");
+                let status = SyncResponse::Status {
                     height: self.blockchain.main_chain_len() as u64,
                     tip_hash: *self.blockchain.latest_block_hash(),
                     cumulative_difficulty: self.blockchain.cumulative_difficulty(),
-                }
+                };
+                info!(
+                    status = ?status,
+                    "Responding with status"
+                );
+                status
             }
             SyncRequest::Blocks(hashes) => {
-                println!("Peer requested {} blocks", hashes.len());
+                info!(
+                    blocks_requested = hashes.len(),
+                    "Peer requested specific blocks"
+                );
+
                 let mut blocks = Vec::new();
                 for hash in hashes {
                     if let Some(block) = self.blockchain.get_block(&hash).cloned() {
@@ -187,7 +207,7 @@ impl Node {
                 SyncResponse::Blocks(blocks)
             }
             SyncRequest::BlockRange { from, to } => {
-                println!("Peer requested blocks from height {from} to {to}");
+                info!(from = from, to = to, "Peer requested block range");
                 let blocks = self.blockchain.get_blocks_in_range(from, to);
                 SyncResponse::Blocks(blocks)
             }
@@ -210,20 +230,24 @@ impl Node {
                         cumulative_difficulty,
                     },
                 ) => {
-                    println!(
-                        "Received status response: height={height}, tip_hash={tip_hash:?}, cumulative_difficulty={cumulative_difficulty}"
+                    info!(
+                        height = height,
+                        tip_hash = ?tip_hash,
+                        cumulative_difficulty = cumulative_difficulty,
+                        "Received status response"
                     );
                     let our_height = self.blockchain.main_chain_len() as u64;
                     let our_difficulty = self.blockchain.cumulative_difficulty();
 
                     if height > our_height || cumulative_difficulty > our_difficulty {
-                        println!(
-                            "Peer is ahead! Them: height={height}, diff={cumulative_difficulty}"
+                        warn!("Peer is ahead, syncing...");
+                        warn!(
+                            peer_height = height,
+                            peer_difficulty = cumulative_difficulty,
+                            our_height = our_height,
+                            our_difficulty = our_difficulty,
+                            "Requesting missing blocks"
                         );
-                        println!(
-                            "                  Us:   height={our_height}, diff={our_difficulty}"
-                        );
-
                         // Request blocks from our height to their height
                         self.request_block_range(our_height, height);
                     }
@@ -231,14 +255,17 @@ impl Node {
                 (SyncRequestType::Blocks(_hashes), SyncResponse::Blocks(blocks)) => {
                     // TODO: Check we got the blocks we requested
 
-                    println!(
-                        "Received {} blocks in response to our request",
-                        blocks.len()
+                    info!(
+                        blocks_received = blocks.len(),
+                        "Received blocks in response"
                     );
                     for block in blocks {
                         match self.blockchain.add_block(block) {
                             BlockAddResult::Added { processed_orphans } => {
-                                println!("✅ Added block, processed {processed_orphans} orphans");
+                                info!(
+                                    processed_orphans = processed_orphans,
+                                    "Added block, processed orphans"
+                                );
                             }
                             BlockAddResult::Orphaned { missing_parent } => {
                                 // Still missing parent, request it
@@ -250,18 +277,18 @@ impl Node {
                 }
 
                 _ => {
-                    println!("Mismatched request and response types");
+                    warn!("Mismatched request and response types");
                 }
             }
         } else {
-            println!("Received response for unknown request ID");
+            warn!("Request ID not found");
         }
     }
 
     fn handle_network_message(&mut self, msg: NetworkMessage) {
         match msg {
             NetworkMessage::Transaction(tx) => {
-                println!("Received transaction: {:?}", tx.hash());
+                info!(tx_hash = ?tx.hash(), "Received transaction from network");
                 // Validate and add to mempool
                 if self.blockchain.validate_transaction(&tx) {
                     self.mempool.add_transaction(tx);
@@ -269,7 +296,7 @@ impl Node {
             }
 
             NetworkMessage::Block(block) => {
-                println!("Received block: {:?}", block.hash());
+                info!(block_hash = ?block.hash(), "Received block from network");
                 if let BlockAddResult::Added { .. } = self.blockchain.add_block(block.clone()) {
                     // Remove included transactions from mempool
                     self.mempool.remove_transactions(block.transactions());
@@ -282,9 +309,9 @@ impl Node {
     fn sync_check(&mut self) {
         // Check 1: Too many orphans?
         if self.blockchain.orphan_count() > 3 {
-            println!(
-                "Orphan pool has {} blocks, requesting parents...",
-                self.blockchain.orphan_count()
+            debug!(
+                orphan_count = self.blockchain.orphan_count(),
+                "Orphan count high, requesting missing blocks"
             );
             let missing = self.blockchain.get_missing_blocks();
             self.request_blocks(missing);
@@ -294,24 +321,23 @@ impl Node {
         self.request_peer_status();
     }
 
-    fn get_random_peer(&self) -> Option<PeerId> {
+    pub fn list_peers(&self) -> impl Iterator<Item = &PeerId> + '_ {
+        self.swarm.behaviour().list_peers()
+    }
+
+    pub fn get_random_peer(&self) -> Option<PeerId> {
         use rand::seq::IteratorRandom;
-        self.swarm
-            .behaviour()
-            .list_peers()
-            .choose(&mut rand::thread_rng())
-            .copied()
+        self.list_peers().choose(&mut rand::thread_rng()).copied()
     }
 
     /// Request status from ONE random peer
     fn request_peer_status(&mut self) {
         let random_peer = self.get_random_peer();
         let Some(peer) = random_peer else {
-            println!("No peers to request status from");
+            warn!("No peers to request status from");
             return;
         };
-
-        println!("Requesting status from peer {peer}");
+        info!(peer = %peer, "Requesting status from peer");
         let request_id = self
             .swarm
             .behaviour_mut()
@@ -326,12 +352,11 @@ impl Node {
         assert!(!hashes.is_empty());
         let random_peer = self.get_random_peer();
         let Some(peer) = random_peer else {
-            println!("No peers to request blocks from");
+            warn!("No peers to request blocks from");
             return;
         };
 
-        println!("Requesting {} blocks from peer {peer}", hashes.len());
-
+        info!(peer = %peer, blocks_requested = hashes.len(), "Requesting blocks from peer");
         let request_id = self
             .swarm
             .behaviour_mut()
@@ -346,11 +371,10 @@ impl Node {
         debug_assert!(to_height > from_height);
         let random_peer = self.get_random_peer();
         let Some(peer) = random_peer else {
-            println!("No peers to request block range from");
+            warn!("No peers to request block range from");
             return;
         };
-
-        println!("Requesting blocks from height {from_height} to {to_height} from peer {peer}");
+        info!(from_height = from_height, to_height = to_height, peer = %peer, "Requesting block range from peer");
 
         let request_id = self.swarm.behaviour_mut().request_response.send_request(
             &peer,
@@ -382,30 +406,112 @@ impl Node {
     }
 
     /// Broadcast a transaction to the network
-    pub fn broadcast_transaction(&mut self, tx: Transaction) {
+    pub fn broadcast_transaction(&mut self, tx: Transaction) -> Result<(), NodeError> {
         let msg = NetworkMessage::Transaction(tx);
-        if let Ok(bytes) = msg.to_bytes() {
-            if let Ok(msg_is) = self
-                .swarm
-                .behaviour_mut()
-                .publish(TOPIC_TRANSACTIONS, bytes)
-            {
-                println!("Broadcasted transaction with message ID: {msg_is}");
-            } else {
-                eprintln!("Failed to broadcast transaction");
+        let bytes = msg.to_bytes()?;
+
+        self.swarm
+            .behaviour_mut()
+            .publish(TOPIC_TRANSACTIONS, bytes)?;
+        Ok(())
+    }
+
+    /// Broadcast a block to the network
+    pub fn broadcast_block(&mut self, block: Block) -> Result<(), NodeError> {
+        let msg = NetworkMessage::Block(block);
+        let bytes = msg.to_bytes()?;
+
+        self.swarm.behaviour_mut().publish(TOPIC_BLOCKS, bytes)?;
+        Ok(())
+    }
+
+    //  ---- Broadcasting Methods ----
+    /// Create and broadcast a transaction to the network
+    pub fn send_transaction(
+        &mut self,
+        receiver_address: &Address,
+        amount: u64,
+    ) -> Result<Transaction, NodeError> {
+        // 1. Create the transaction
+        let tx = self.wallet.create_transaction(receiver_address, amount);
+        // 2. Try to locally validate before broadcasting
+        if !self.blockchain.validate_transaction(&tx) {
+            return Err(NodeError::InsufficientBalance);
+        }
+        // 3. Add to the local mempool
+        self.mempool.add_transaction(tx.clone());
+        // 4. Broadcast to the network
+        self.broadcast_transaction(tx.clone())?;
+        info!(
+            tx_hash = ?tx.hash(),
+            receiver_address = %receiver_address,
+            amount = amount,
+            "Created and broadcasted transaction"
+        );
+        Ok(tx)
+    }
+
+    pub fn mine_block(&mut self) -> Result<Block, NodeError> {
+        // When we mine should we look at the block just mined, find all txs in the mempool relating to that tx and remove it? Like we need to clean the mempool occasionally from successful txs
+        // 1. Get transactions from mempool
+        let mut txs = Vec::new();
+        while let Some(tx) = self.mempool.get_transaction() {
+            // Locally validated (need to validate in order as well but the miner should do that)
+            if self.blockchain.validate_transaction(&tx) {
+                txs.push(tx);
+                if txs.len() >= 10 {
+                    break; // limit to 10 transactions per block for now
+                }
+            }
+        }
+
+        // 2. Create new block
+        info!(tx_count = txs.len(), "Mining new block with transactions");
+        let previous_hash = *self.blockchain.latest_block_hash();
+        let index = self.blockchain.height();
+        let constructor =
+            BlockConstructor::new(index, &txs, previous_hash, Some(*self.wallet.address()));
+
+        let mined_block = self.blockchain.mine(constructor);
+
+        info!(block_hash = ?mined_block.hash(), "Mined new block");
+
+        // 4. Add to our own blockchain
+        match self.blockchain.add_block(mined_block.clone()) {
+            BlockAddResult::Added { .. } => {
+                // 5. Broadcast to network
+                self.broadcast_block(mined_block.clone())?;
+                Ok(mined_block)
+            }
+            BlockAddResult::Orphaned { missing_parent } => {
+                // This should not happen since we just mined it
+                info!(missing_parent = ?missing_parent, "Mined block is orphaned, missing parent");
+                Err(NodeError::BlockRejected)
+            }
+            BlockAddResult::Rejected(reason) => {
+                warn!(reason = ?reason, "Mined block was rejected");
+                Err(NodeError::BlockRejected)
             }
         }
     }
 
-    /// Broadcast a block to the network
-    pub fn broadcast_block(&mut self, block: Block) {
-        let msg = NetworkMessage::Block(block);
-        if let Ok(bytes) = msg.to_bytes() {
-            if let Ok(msg_id) = self.swarm.behaviour_mut().publish(TOPIC_BLOCKS, bytes) {
-                println!("Broadcasted block with message ID: {msg_id}");
-            } else {
-                eprintln!("Failed to broadcast block");
-            }
-        }
+    pub fn my_address(&self) -> Address {
+        *self.wallet.address()
     }
+
+    pub fn get_balance(&self) -> Option<u64> {
+        self.blockchain.get_balance(self.wallet.address())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NodeError {
+    #[error("Insufficient balance")]
+    InsufficientBalance,
+    #[error("Block rejected")]
+    BlockRejected,
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] serde_json::Error),
+    #[error("Network error: {0}")]
+    NetworkError(#[from] network::NetworkError),
 }

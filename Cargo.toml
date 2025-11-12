@@ -24,7 +24,6 @@ blake3 = { version = "1.8", features = ["serde"] }
 ed25519-dalek = { version = "2.2", features = ["serde", "rand_core"] }
 serde_valid = "2.0"
 rand = { version = "0.8" }
-serde_json = { version = "1" }
 hex = { version = "0.4", features = ["serde"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 thiserror = "2.0"
@@ -42,12 +41,20 @@ libp2p = { version = "0.56", features = [
 ] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rayon = "1.11"
 
 blockchain-types = { path = "crates/blockchain-types" }
 blockchain = { path = "crates/blockchain" }
 mempool = { path = "crates/mempool" }
 network = { path = "crates/network" }
 node = { path = "crates/node" }
+
+# Dev dependencies
+criterion = { version = "0.7", features = ["html_reports"] }
+serde_json = { version = "1" }
+
 
 [workspace.lints.clippy]
 
@@ -102,7 +109,7 @@ pedantic = { level = "warn", priority = -1 }
 [workspace.lints.rust]
 # Standard Rust lints
 #smissing_docs = "warn"
-unsafe_code = "forbid"
+#unsafe_code = "forbid"
 rust_2018_idioms = { level = "warn", priority = -1 }
 trivial_casts = "warn"
 trivial_numeric_casts = "warn"
@@ -112,3 +119,9 @@ unused_qualifications = "warn"
 
 unused_variables = "allow"
 dead_code = "allow"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"      # Link-time optimization (faster builds than "fat")
+codegen-units = 1 # Better optimization, slower build
+debug = false     # No debug symbols

@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -21,7 +22,22 @@ rand = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 serde_valid = { workspace = true }
+rayon = { workspace = true, optional = true }
+
 [dev-dependencies]
 serde_json = { workspace = true }
+criterion = { workspace = true }
+
+[features]
+default = ["rayon"]
+sse2 = []
+rayon = ["dep:rayon", "blake3/rayon"]
+
+
+[[bench]]
+name = "mining"
+harness = false
+
+
 [lints]
 workspace = true

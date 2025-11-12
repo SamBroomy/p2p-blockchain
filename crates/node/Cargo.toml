@@ -12,13 +12,16 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
 blockchain = { workspace = true }
 mempool = { workspace = true }
 network = { workspace = true }
+serde_json = { workspace = true }
 blockchain-types = { workspace = true }
 libp2p = { workspace = true }
 blake3 = { workspace = true }
 tokio = { workspace = true, features = ["io-std"] }
 rand = { workspace = true }
+tracing = { workspace = true }
 [lints]
 workspace = true

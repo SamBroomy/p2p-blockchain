@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_valid::Validate;
 
 use crate::{
-    GENESIS_ROOT_HASH,
+    consts::BLOCK_REWARD_SIGNATURE_BYTES,
     wallet::{Address, private_key::PrivateKey},
 };
 
@@ -36,11 +36,9 @@ impl TransactionConstructor {
 
     pub(super) fn block_reward(miner_address: &Address, amount: u64) -> Transaction {
         debug_assert!(amount > 0, "Block reward amount must be greater than 0");
-        let genesis_address = Address::from_bytes(GENESIS_ROOT_HASH.as_bytes())
-            .expect("Failed to create genesis address");
-        let inner = InnerTransaction::new(genesis_address, *miner_address, amount);
+        let inner = InnerTransaction::block_reward(*miner_address, amount);
         // Block rewards use a dummy signature (all zeros)
-        let dummy_signature = Signature::from_bytes(&[0u8; 64]);
+        let dummy_signature = Signature::from_bytes(&BLOCK_REWARD_SIGNATURE_BYTES);
         // Hash includes the dummy signature
         let transaction_hash =
             utils::hash_transaction_complete(Hasher::new(), &inner, dummy_signature);
@@ -48,10 +46,16 @@ impl TransactionConstructor {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TransactionType {
+    Transfer { sender: Address, receiver: Address },
+    BlockReward { miner: Address },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct InnerTransaction {
-    sender: Address,   // Public key (address)
-    receiver: Address, // Public key (address)
+    tx_type: TransactionType,
     amount: u64,
     timestamp: DateTime<Utc>,
 }
@@ -63,18 +67,27 @@ impl InnerTransaction {
 
     fn new(sender: Address, receiver: Address, amount: u64) -> Self {
         Self {
-            sender,
-            receiver,
+            tx_type: TransactionType::Transfer { sender, receiver },
+            amount,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn block_reward(miner: Address, amount: u64) -> Self {
+        Self {
+            tx_type: TransactionType::BlockReward { miner },
             amount,
             timestamp: Utc::now(),
         }
     }
 
     fn is_block_reward(&self) -> bool {
-        utils::is_block_reward(&self.sender)
+        matches!(self.tx_type, TransactionType::BlockReward { .. })
     }
 }
 
+/// A valid transaction with signature and hash
+/// Can only be created via a `Wallet` or `TransactionConstructor`
 #[derive(Debug, Clone, Serialize, Deserialize, Validate, PartialEq, Eq)]
 #[validate(custom = utils::validate_transaction)] // to uphold our invariant that a Transaction is always valid (even when deserialized)
 pub struct Transaction {
@@ -121,12 +134,18 @@ impl Transaction {
     }
 
     // Add public accessors
-    pub fn sender(&self) -> &Address {
-        &self.inner.sender
+    pub fn sender(&self) -> Option<&Address> {
+        match &self.inner.tx_type {
+            TransactionType::Transfer { sender, .. } => Some(sender),
+            TransactionType::BlockReward { .. } => None, // No sender!
+        }
     }
 
     pub fn receiver(&self) -> &Address {
-        &self.inner.receiver
+        match &self.inner.tx_type {
+            TransactionType::Transfer { receiver, .. } => receiver,
+            TransactionType::BlockReward { miner } => miner,
+        }
     }
 
     pub fn amount(&self) -> u64 {
@@ -139,7 +158,7 @@ impl Transaction {
     }
 
     pub fn is_block_reward(&self) -> bool {
-        self.inner.sender.as_bytes() == GENESIS_ROOT_HASH.as_bytes()
+        matches!(self.inner.tx_type, TransactionType::BlockReward { .. })
     }
 }
 
@@ -150,20 +169,35 @@ impl Transaction {
 // }
 
 mod utils {
-    use super::{Address, DateTime, Hash, Hasher, InnerTransaction, Signature, Transaction, Utc};
-    use crate::GENESIS_ROOT_HASH;
+    use super::{
+        DateTime, Hash, Hasher, InnerTransaction, Signature, Transaction, TransactionType, Utc,
+    };
+    use crate::consts::BLOCK_REWARD_SIGNATURE_BYTES;
+
+    #[inline]
+    fn hash_transaction_type(hasher: &mut Hasher, tx_type: &TransactionType) {
+        match tx_type {
+            TransactionType::Transfer { sender, receiver } => {
+                hasher.update(b"transfer"); // Type discriminator
+                hasher.update(sender.as_bytes());
+                hasher.update(receiver.as_bytes());
+            }
+            TransactionType::BlockReward { miner } => {
+                hasher.update(b"block_reward"); // Type discriminator
+                hasher.update(miner.as_bytes());
+            }
+        }
+    }
 
     #[inline]
     fn hash_transaction_inner_data(
         mut hasher: Hasher,
-        sender: Address,
-        receiver: Address,
+        tx_type: &TransactionType,
         amount: u64,
         timestamp: DateTime<Utc>,
     ) -> Hasher {
+        hash_transaction_type(&mut hasher, tx_type);
         hasher
-            .update(sender.as_bytes())
-            .update(receiver.as_bytes())
             .update(&amount.to_le_bytes())
             .update(&timestamp.timestamp_millis().to_le_bytes());
         hasher
@@ -171,20 +205,18 @@ mod utils {
     #[inline]
     fn hash_transaction_data(
         hasher: Hasher,
-        sender: Address,
-        receiver: Address,
+        tx_type: &TransactionType,
         amount: u64,
         timestamp: DateTime<Utc>,
     ) -> Hash {
-        hash_transaction_inner_data(hasher, sender, receiver, amount, timestamp).finalize()
+        hash_transaction_inner_data(hasher, tx_type, amount, timestamp).finalize()
     }
 
     #[inline]
     pub fn hash_inner_transaction(hasher: Hasher, inner_tx: &InnerTransaction) -> Hash {
         hash_transaction_data(
             hasher,
-            inner_tx.sender,
-            inner_tx.receiver,
+            &inner_tx.tx_type,
             inner_tx.amount,
             inner_tx.timestamp,
         )
@@ -193,13 +225,12 @@ mod utils {
     #[inline]
     fn hash_transaction_inner(
         hasher: Hasher,
-        sender: Address,
-        receiver: Address,
+        tx_type: &TransactionType,
         amount: u64,
         timestamp: DateTime<Utc>,
         signature: Signature,
     ) -> Hasher {
-        let mut hasher = hash_transaction_inner_data(hasher, sender, receiver, amount, timestamp);
+        let mut hasher = hash_transaction_inner_data(hasher, tx_type, amount, timestamp);
         hasher.update(signature.to_bytes().as_ref());
         hasher
     }
@@ -207,13 +238,12 @@ mod utils {
     #[inline]
     fn hash_transaction(
         hasher: Hasher,
-        sender: Address,
-        receiver: Address,
+        tx_type: &TransactionType,
         amount: u64,
         timestamp: DateTime<Utc>,
         signature: Signature,
     ) -> Hash {
-        hash_transaction_inner(hasher, sender, receiver, amount, timestamp, signature).finalize()
+        hash_transaction_inner(hasher, tx_type, amount, timestamp, signature).finalize()
     }
 
     pub fn hash_transaction_complete(
@@ -223,8 +253,7 @@ mod utils {
     ) -> Hash {
         hash_transaction(
             hasher,
-            inner_tx.sender,
-            inner_tx.receiver,
+            &inner_tx.tx_type,
             inner_tx.amount,
             inner_tx.timestamp,
             signature,
@@ -232,10 +261,16 @@ mod utils {
     }
     #[inline]
     fn is_valid_signature(inner_tx: &InnerTransaction, signature: &Signature) -> bool {
-        inner_tx
-            .sender
-            .verify(inner_tx.hash().as_bytes(), signature)
-            .is_ok()
+        // Only transfer transactions need signature validation
+        match &inner_tx.tx_type {
+            TransactionType::Transfer { sender, .. } => {
+                sender.verify(inner_tx.hash().as_bytes(), signature).is_ok()
+            }
+            TransactionType::BlockReward { .. } => {
+                // Block rewards use dummy signature (all zeros)
+                signature.to_bytes() == BLOCK_REWARD_SIGNATURE_BYTES
+            }
+        }
     }
 
     #[inline]
@@ -246,23 +281,14 @@ mod utils {
     ) -> bool {
         *hash == hash_transaction_complete(Hasher::new(), inner, *signature)
     }
-    pub fn is_block_reward(address: &Address) -> bool {
-        address.as_bytes() == GENESIS_ROOT_HASH.as_bytes()
-    }
-
     #[inline]
     pub fn is_valid_transaction(
         inner_tx: &InnerTransaction,
         signature: &Signature,
         hash: &Hash,
     ) -> bool {
-        if inner_tx.is_block_reward() {
-            is_valid_block_reward(inner_tx, signature, hash)
-        } else {
-            // Regular transaction checks
-            is_valid_signature(inner_tx, signature)
-                && is_valid_transaction_hash(hash, inner_tx, signature)
-        }
+        is_valid_signature(inner_tx, signature)
+            && is_valid_transaction_hash(hash, inner_tx, signature)
     }
 
     #[inline]
@@ -271,31 +297,21 @@ mod utils {
         signature: &Signature,
         hash: &Hash,
     ) -> bool {
-        // Block rewards must:
-        // 1. Have genesis as sender
-        if inner_tx.sender.as_bytes() != GENESIS_ROOT_HASH.as_bytes() {
+        if !matches!(inner_tx.tx_type, TransactionType::BlockReward { .. }) {
             return false;
         }
 
-        // 2. Have dummy signature (all zeros)
-        if signature.to_bytes() != [0u8; 64] {
+        // Dummy signature validation
+        if signature.to_bytes() != BLOCK_REWARD_SIGNATURE_BYTES {
             return false;
         }
 
-        // 3. Have correct hash
+        // Hash validation
         is_valid_transaction_hash(hash, inner_tx, signature)
     }
 
     pub fn validate_transaction(tx: &Transaction) -> Result<(), serde_valid::validation::Error> {
-        if tx.is_block_reward() {
-            if is_valid_block_reward(&tx.inner, &tx.signature, &tx.hash) {
-                Ok(())
-            } else {
-                Err(serde_valid::validation::Error::Custom(
-                    "Invalid block reward".to_owned(),
-                ))
-            }
-        } else if is_valid_transaction(&tx.inner, &tx.signature, &tx.hash) {
+        if is_valid_transaction(&tx.inner, &tx.signature, &tx.hash) {
             Ok(())
         } else {
             Err(serde_valid::validation::Error::Custom(
@@ -324,7 +340,7 @@ mod tests {
 
         let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, &sender_sk);
 
-        assert_eq!(tx.sender(), &sender_pk);
+        assert_eq!(tx.sender(), Some(&sender_pk));
         assert_eq!(tx.receiver(), &receiver_pk);
         assert_eq!(tx.amount(), 100);
         assert!(tx.is_validate());
@@ -392,7 +408,7 @@ mod tests {
         assert!(reward.is_block_reward());
         assert_eq!(reward.receiver(), &miner_pk);
         assert_eq!(reward.amount(), 50);
-        assert_eq!(reward.sender().as_bytes(), GENESIS_ROOT_HASH.as_bytes());
+        assert_eq!(reward.sender(), None);
         assert!(reward.is_validate());
     }
 
@@ -410,5 +426,68 @@ mod tests {
         assert_eq!(reward.receiver(), deserialized.receiver());
         assert_eq!(reward.amount(), deserialized.amount());
         assert!(deserialized.is_validate());
+    }
+
+    #[test]
+    fn test_block_reward_has_no_sender() {
+        let miner_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+        let reward = TransactionConstructor::block_reward(&miner_pk, 50);
+
+        assert_eq!(reward.sender(), None, "Block rewards should have no sender");
+        assert_eq!(
+            reward.receiver(),
+            &miner_pk,
+            "Receiver should be miner address"
+        );
+    }
+
+    #[test]
+    fn test_transfer_has_sender() {
+        let mut csprng = OsRng;
+        let sk = SigningKey::generate(&mut csprng);
+        let sender_pk = Address::from_verifying_key(sk.verifying_key());
+        let sender_sk = PrivateKey::from_singing_key(sk);
+        let receiver_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+
+        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, &sender_sk);
+
+        assert_eq!(tx.sender(), Some(&sender_pk), "Transfer should have sender");
+        assert_eq!(tx.receiver(), &receiver_pk);
+    }
+
+    #[test]
+    fn test_block_reward_uses_dummy_signature() {
+        let miner_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+        let reward = TransactionConstructor::block_reward(&miner_pk, 50);
+
+        assert!(reward.is_validate(), "Block reward should be valid");
+        assert!(
+            reward.is_block_reward(),
+            "Should be identified as block reward"
+        );
+    }
+
+    #[test]
+    fn test_transaction_type_discriminator_in_hash() {
+        let miner_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+
+        let reward1 = TransactionConstructor::block_reward(&miner_pk, 50);
+        std::thread::sleep(std::time::Duration::from_millis(5)); // Ensure different timestamp
+        let reward2 = TransactionConstructor::block_reward(&miner_pk, 50);
+
+        // Different timestamps mean different hashes even for same amount/receiver
+        assert_ne!(
+            reward1.hash(),
+            reward2.hash(),
+            "Different timestamps should produce different hashes"
+        );
+
+        // But both should be valid block rewards
+        assert!(reward1.is_block_reward());
+        assert!(reward2.is_block_reward());
     }
 }

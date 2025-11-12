@@ -8,7 +8,7 @@ use rand::rngs::OsRng;
 
 use crate::transaction::{Transaction, TransactionConstructor};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wallet {
     private_key: PrivateKey,
     public_key: Address,
@@ -102,7 +102,7 @@ mod tests {
 
         let tx = sender.create_transaction(receiver.address(), 100);
 
-        assert_eq!(tx.sender(), sender.address());
+        assert_eq!(tx.sender(), Some(sender.address()));
         assert_eq!(tx.receiver(), receiver.address());
         assert_eq!(tx.amount(), 100);
         assert!(tx.is_validate());

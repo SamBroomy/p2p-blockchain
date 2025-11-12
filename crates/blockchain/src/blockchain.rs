@@ -1,7 +1,14 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    marker::PhantomData,
+};
 
 use blake3::Hash;
-use blockchain_types::{Block, BlockConstructor, GENESIS_ROOT_HASH, Transaction};
+use blockchain_types::{
+    Block, BlockConstructor, Miner, MinerSimple, MiningStrategy, Transaction,
+    consts::GENESIS_ROOT_HASH, wallet::Address,
+};
+use tracing::info;
 
 use crate::{
     chain::{Chain, ForkChain, RootChain, is_connecting_block_valid},
@@ -58,7 +65,7 @@ impl BlockAddResult {
     }
 }
 
-pub struct BlockChain {
+pub struct BlockChain<M: MiningStrategy = MinerSimple> {
     /// The main accepted chain. Should always be the chain with the highest cumulative difficulty
     main_chain: Chain<RootChain>,
     /// Active forks diverging from the main chain
@@ -66,15 +73,48 @@ pub struct BlockChain {
     /// Orphaned block waiting for parents
     orphan_pool: OrphanPool,
     /// Mining difficulty
-    difficulty: usize,
+    pub difficulty: usize,
+
+    _miner: PhantomData<M>,
 }
 
-impl BlockChain {
-    fn create_genesis_block(difficulty: usize) -> Block {
-        BlockConstructor::new(0, &[], GENESIS_ROOT_HASH, None).mine(difficulty, None)
+// Concrete implementation ONLY for the default type
+impl BlockChain<MinerSimple> {
+    /// Create a new blockchain with the default `MinerSimple`.
+    ///
+    /// For other miner types, use:
+    /// ```rust,ignore
+    /// let blockchain: BlockChain<MinerConst<8>> = BlockChain::new_with_miner(8);
+    /// ```
+    pub fn new(difficulty: usize) -> Self {
+        Self::new_with_miner(difficulty)
+    }
+}
+
+// You could also add convenience constructors for common types
+impl<const D: usize> BlockChain<Miner<D>> {
+    /// Create a blockchain with const generic difficulty
+    pub fn new_miner() -> Self {
+        Self::new_with_miner(D)
+    }
+}
+
+impl<M: MiningStrategy> BlockChain<M> {
+    pub fn mine(&self, constructor: BlockConstructor) -> Block {
+        let random_nonce = rand::random::<u64>();
+        M::mine(constructor, self.difficulty, Some(random_nonce))
     }
 
-    pub fn new(difficulty: usize) -> Self {
+    fn create_genesis_block(difficulty: usize) -> Block {
+        M::mine(
+            BlockConstructor::new(0, &[], GENESIS_ROOT_HASH, None),
+            difficulty,
+            None,
+        )
+    }
+
+    // Public constructor when you specify the type explicitly
+    pub fn new_with_miner(difficulty: usize) -> Self {
         let genesis = Self::create_genesis_block(difficulty);
         assert!(genesis.is_valid(), "Genesis block must be valid");
         assert_eq!(
@@ -87,6 +127,7 @@ impl BlockChain {
             forks: Vec::new(),
             orphan_pool: OrphanPool::new(),
             difficulty,
+            _miner: PhantomData,
         }
     }
 
@@ -310,7 +351,7 @@ impl BlockChain {
                     );
                     // The old main chain tail is now a fork
                     self.forks.push(old_main_chain_fork);
-                    println!("Chain reorganization occurred!");
+                    info!("Chain reorganization occurred!");
                 }
                 Err(fork) => {
                     // Merge failed (shouldn't happen), restore fork
@@ -403,6 +444,10 @@ impl BlockChain {
     pub fn cumulative_difficulty(&self) -> u128 {
         self.main_chain.cumulative_difficulty()
     }
+
+    pub fn get_balance(&self, address: &Address) -> Option<u64> {
+        self.main_chain.get_balance(address)
+    }
 }
 
 #[cfg(test)]
@@ -410,9 +455,33 @@ mod tests {
 
     use std::assert_matches::assert_matches;
 
-    use blockchain_types::{Transaction, wallet::Wallet};
+    use blockchain_types::{Miner, MinerSimple, MiningStrategy, Transaction, wallet::Wallet};
 
     use super::*;
+
+    #[test]
+    fn test_default_miner() {
+        let blockchain = BlockChain::new(1);
+        assert_eq!(blockchain.difficulty, 1);
+    }
+
+    #[test]
+    fn test_explicit_simple_miner() {
+        let blockchain: BlockChain<MinerSimple> = BlockChain::new_with_miner(2);
+        assert_eq!(blockchain.difficulty, 2);
+    }
+
+    #[test]
+    fn test_const_miner() {
+        let blockchain: BlockChain<Miner<4>> = BlockChain::new_with_miner(4);
+        assert_eq!(blockchain.difficulty, 4);
+    }
+
+    #[test]
+    fn test_const_miner_with_helper() {
+        let blockchain = BlockChain::<Miner<8>>::new_miner();
+        assert_eq!(blockchain.difficulty, 8);
+    }
 
     fn mine_block(
         index: u64,
@@ -420,7 +489,11 @@ mod tests {
         transactions: &[Transaction],
         difficulty: usize,
     ) -> Block {
-        BlockConstructor::new(index, transactions, previous_hash, None).mine(difficulty, None)
+        MinerSimple::mine(
+            BlockConstructor::new(index, transactions, previous_hash, None),
+            difficulty,
+            None,
+        )
     }
 
     #[test]

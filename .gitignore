@@ -1,1 +1,12 @@
+*
+!*/
 /target
+
+!.gitignore
+!/crates/**/*.rs
+!/crates/**/Cargo.toml
+!/Cargo.toml
+!/Cargo.lock
+!justfile
+!rust-toolchain.toml
+!rustfmt.toml

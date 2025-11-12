@@ -40,13 +40,19 @@ impl Address {
             .map(Self)
             .map_err(AddressError::SignatureError)
     }
+
+    pub fn from_hex(address_string: impl AsRef<[u8]>) -> Result<Self, AddressError> {
+        let mut array = [0u8; 32];
+        hex::decode_to_slice(address_string, &mut array)?;
+        Self::from_bytes(&array)
+    }
 }
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Display first 8 bytes as hex (like Bitcoin/Ethereum addresses)
         let bytes = self.0.as_bytes();
-        write!(f, "{}", hex::encode(&bytes[..8]))
+        write!(f, "{}", hex::encode(bytes))
     }
 }
 
@@ -90,4 +96,6 @@ pub enum AddressError {
     InvalidAddress,
     #[error("Signature error: {0}")]
     SignatureError(#[from] SignatureError),
+    #[error("Hex decoding error: {0}")]
+    HexDecodeError(#[from] hex::FromHexError),
 }

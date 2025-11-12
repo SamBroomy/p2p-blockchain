@@ -1,13 +1,17 @@
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData};
 
 use blake3::Hash;
-use blockchain_types::{Block, GENESIS_ROOT_HASH, Transaction, wallet::Address};
+use blockchain_types::{
+    Block, Transaction,
+    consts::{GENESIS_ROOT_HASH, WALLET_INITIAL_BALANCE},
+    wallet::Address,
+};
 use serde::{Deserialize, Serialize};
 
 type Balance = u64;
 type Delta = i64;
 // As our implementation dosent have block rewards yet, everyone starts with an initial balance to make things easier
-const INITIAL_BALANCE: Balance = 100;
+pub const INITIAL_BALANCE: Balance = WALLET_INITIAL_BALANCE;
 const INITIAL_DELTA: Delta = INITIAL_BALANCE as Delta;
 type AccountBalances = HashMap<Address, Balance>;
 type AccountDelta = HashMap<Address, Delta>;
@@ -45,7 +49,9 @@ pub fn is_connecting_block_valid(previous_block: &Block, new_block: &Block) -> b
 fn update_deltas(deltas: &mut AccountDelta, txs: &[Transaction]) {
     for tx in txs {
         *deltas.entry(*tx.receiver()).or_insert(0) += tx.amount() as Delta;
-        *deltas.entry(*tx.sender()).or_insert(0) -= tx.amount() as Delta;
+        if let Some(sender) = tx.sender() {
+            *deltas.entry(*sender).or_insert(0) -= tx.amount() as Delta;
+        }
     }
 }
 fn get_transaction_deltas(txs: &[Transaction]) -> AccountDelta {
@@ -83,7 +89,7 @@ fn apply_deltas_to_balances(balances: &mut AccountBalances, deltas: AccountDelta
 }
 
 /// Recalculates balances from genesis (first block must connect to `GENESIS_ROOT_HASH`)
-pub(super) fn recalculate_balances(blocks: &[Block]) -> HashMap<Address, Balance> {
+pub fn recalculate_balances(blocks: &[Block]) -> HashMap<Address, Balance> {
     assert!(
         !blocks.is_empty(),
         "Cannot recalculate balances of an empty chain"
@@ -134,8 +140,10 @@ fn reverse_transactions_from(
             let receiver_balance = balances.entry(*tx.receiver()).or_insert(INITIAL_BALANCE);
             *receiver_balance -= tx.amount();
 
-            let sender_balance = balances.entry(*tx.sender()).or_insert(INITIAL_BALANCE);
-            *sender_balance += tx.amount();
+            if let Some(sender) = tx.sender() {
+                let sender_balance = balances.entry(*sender).or_insert(INITIAL_BALANCE);
+                *sender_balance += tx.amount();
+            }
         }
     }
 
@@ -150,7 +158,7 @@ fn verify_balances(_balances: &AccountBalances) -> bool {
 // A valid chain must have at least one block
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(bound = "")]
-pub(super) struct Chain<T: ChainType = RootChain> {
+pub struct Chain<T: ChainType = RootChain> {
     /// Ordered sequence of blocks
     blocks: Vec<Block>,
     /// Must be valid non-negative balances.
@@ -175,7 +183,7 @@ impl<T: ChainType> Chain<T> {
         self.root_block().hash()
     }
 
-    fn get_balance(&self, address: &Address) -> Option<Balance> {
+    pub fn get_balance(&self, address: &Address) -> Option<Balance> {
         self.balances.get(address).copied()
     }
 
@@ -251,7 +259,10 @@ impl<T: ChainType> Chain<T> {
     }
 
     pub fn validate_transaction(&self, tx: &Transaction) -> bool {
-        let sender_balance = self.get_balance(tx.sender()).unwrap_or(INITIAL_BALANCE);
+        let sender_balance = tx
+            .sender()
+            .and_then(|addr| self.get_balance(addr))
+            .unwrap_or(INITIAL_BALANCE);
         sender_balance >= tx.amount()
     }
 }
@@ -589,7 +600,7 @@ impl Chain<ForkChain> {
 
 #[cfg(test)]
 mod tests {
-    use blockchain_types::{BlockConstructor, wallet::Wallet};
+    use blockchain_types::{BlockConstructor, MinerSimple, MiningStrategy, wallet::Wallet};
 
     use super::*;
 
@@ -599,7 +610,11 @@ mod tests {
         transactions: &[Transaction],
         difficulty: usize,
     ) -> Block {
-        BlockConstructor::new(index, transactions, previous_hash, None).mine(difficulty, None)
+        MinerSimple::mine(
+            BlockConstructor::new(index, transactions, previous_hash, None),
+            difficulty,
+            None,
+        )
     }
 
     #[test]
