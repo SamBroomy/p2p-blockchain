@@ -80,6 +80,10 @@ impl Mempool {
     pub fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
+
+    pub fn pending_transactions(&self) -> impl Iterator<Item = &Transaction> {
+        self.transactions.iter()
+    }
 }
 impl Default for Mempool {
     fn default() -> Self {

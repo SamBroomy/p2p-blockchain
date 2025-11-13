@@ -4,7 +4,7 @@ use blake3::{Hash, Hasher};
 use blockchain_types::{
     BlockConstructor,
     block::mining::{
-        Miner, MinerSimple, MiningStrategy,
+        ConstMiner, Miner, MiningStrategy,
         mining_utils::{hash_with_nonce, is_valid_target_hash, is_valid_target_hash_const},
         simd::is_valid_target_hash_simd,
     },
@@ -592,14 +592,14 @@ fn bench_mining_comparison(c: &mut Criterion) {
     group.bench_function("sequential_runtime_D=0", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(MinerSimple::mine(constructor, 0, 0))
+            black_box(Miner::mine(constructor, 0, 0))
         });
     });
 
     group.bench_function("sequential_const_D=0", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<0>::mine(constructor, 0, 0))
+            black_box(ConstMiner::<0>::mine(constructor, 0, 0))
         });
     });
 
@@ -607,14 +607,14 @@ fn bench_mining_comparison(c: &mut Criterion) {
     group.bench_function("sequential_runtime_D=2", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(MinerSimple::mine(constructor, 2, 0))
+            black_box(Miner::mine(constructor, 2, 0))
         });
     });
 
     group.bench_function("sequential_const_D=2", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<2>::mine(constructor, 2, 0))
+            black_box(ConstMiner::<2>::mine(constructor, 2, 0))
         });
     });
 
@@ -622,14 +622,14 @@ fn bench_mining_comparison(c: &mut Criterion) {
     group.bench_function("sequential_runtime_D=4", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(MinerSimple::mine(constructor, 4, 0))
+            black_box(Miner::mine(constructor, 4, 0))
         });
     });
 
     group.bench_function("sequential_const_D=4", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<4>::mine(constructor, 4, 0))
+            black_box(ConstMiner::<4>::mine(constructor, 4, 0))
         });
     });
 
@@ -637,7 +637,7 @@ fn bench_mining_comparison(c: &mut Criterion) {
     group.bench_function("parallel_const_D=4", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<4>::mine(constructor, 4, 0))
+            black_box(ConstMiner::<4>::mine(constructor, 4, 0))
         });
     });
 
@@ -655,7 +655,7 @@ fn bench_time_to_solution(c: &mut Criterion) {
     group.bench_function("D=0_instant", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<0>::mine(constructor, 0, 0))
+            black_box(ConstMiner::<0>::mine(constructor, 0, 0))
         });
     });
 
@@ -663,7 +663,7 @@ fn bench_time_to_solution(c: &mut Criterion) {
     group.bench_function("D=1_approx_16_hashes", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<1>::mine(constructor, 1, 0))
+            black_box(ConstMiner::<1>::mine(constructor, 1, 0))
         });
     });
 
@@ -671,7 +671,7 @@ fn bench_time_to_solution(c: &mut Criterion) {
     group.bench_function("D=2_approx_256_hashes", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<2>::mine(constructor, 2, 0))
+            black_box(ConstMiner::<2>::mine(constructor, 2, 0))
         });
     });
 
@@ -679,7 +679,7 @@ fn bench_time_to_solution(c: &mut Criterion) {
     group.bench_function("D=3_approx_4k_hashes", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<3>::mine(constructor, 3, 0))
+            black_box(ConstMiner::<3>::mine(constructor, 3, 0))
         });
     });
 
@@ -687,7 +687,7 @@ fn bench_time_to_solution(c: &mut Criterion) {
     group.bench_function("D=4_approx_65k_hashes", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<4>::mine(constructor, 4, 0))
+            black_box(ConstMiner::<4>::mine(constructor, 4, 0))
         });
     });
 
@@ -697,7 +697,7 @@ fn bench_time_to_solution(c: &mut Criterion) {
     group.bench_function("D=5_approx_1m_hashes", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<5>::mine(constructor, 5, 0))
+            black_box(ConstMiner::<5>::mine(constructor, 5, 0))
         });
     });
 
@@ -799,7 +799,7 @@ fn bench_parallel_vs_sequential(c: &mut Criterion) {
     group.bench_function("sequential_D=4", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<4>::mine(constructor, 4, 0))
+            black_box(ConstMiner::<4>::mine(constructor, 4, 0))
         });
     });
 
@@ -808,7 +808,7 @@ fn bench_parallel_vs_sequential(c: &mut Criterion) {
         b.iter(|| {
             let constructor = create_test_constructor();
             // Force parallel by using D >= 6
-            black_box(Miner::<6>::mine(constructor, 6, 0))
+            black_box(ConstMiner::<6>::mine(constructor, 6, 0))
         });
     });
 
@@ -817,7 +817,7 @@ fn bench_parallel_vs_sequential(c: &mut Criterion) {
         b.iter(|| {
             let constructor = create_test_constructor();
             // Use D < 6 to force sequential in MinerConst
-            black_box(Miner::<5>::mine(constructor, 5, 0))
+            black_box(ConstMiner::<5>::mine(constructor, 5, 0))
         });
     });
 
@@ -826,7 +826,7 @@ fn bench_parallel_vs_sequential(c: &mut Criterion) {
             let constructor = create_test_constructor();
             // Use runtime miner which doesn't have the D < 6 sequential optimization
             // Or we need to create a separate parallel miner for testing
-            black_box(Miner::<6>::mine(constructor, 6, 0))
+            black_box(ConstMiner::<6>::mine(constructor, 6, 0))
         });
     });
 
@@ -843,7 +843,7 @@ fn bench_strategy_selection(c: &mut Criterion) {
     group.bench_function("D=5_strategy_decision", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<5>::mine(constructor, 5, 0))
+            black_box(ConstMiner::<5>::mine(constructor, 5, 0))
         });
     });
 
@@ -852,7 +852,7 @@ fn bench_strategy_selection(c: &mut Criterion) {
     group.bench_function("D=6_parallel_threshold", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<6>::mine(constructor, 6, 0))
+            black_box(ConstMiner::<6>::mine(constructor, 6, 0))
         });
     });
 
@@ -861,7 +861,7 @@ fn bench_strategy_selection(c: &mut Criterion) {
     group.bench_function("D=8_simd_threshold", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<8>::mine(constructor, 8, 0))
+            black_box(ConstMiner::<8>::mine(constructor, 8, 0))
         });
     });
 
@@ -893,7 +893,7 @@ fn bench_block_construction(c: &mut Criterion) {
     group.bench_function("full_mine_D=0", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<0>::mine(constructor, 0, 0))
+            black_box(ConstMiner::<0>::mine(constructor, 0, 0))
         });
     });
 
@@ -909,7 +909,7 @@ fn bench_nonce_strategies(c: &mut Criterion) {
     group.bench_function("sequential_from_0_D=4", |b| {
         b.iter(|| {
             let constructor = create_test_constructor();
-            black_box(Miner::<4>::mine(constructor, 4, 0))
+            black_box(ConstMiner::<4>::mine(constructor, 4, 0))
         });
     });
 
@@ -923,7 +923,7 @@ fn bench_nonce_strategies(c: &mut Criterion) {
 
                 RandomState::new().hash_one(std::time::SystemTime::now())
             };
-            black_box(Miner::<4>::mine(constructor, 4, random_start))
+            black_box(ConstMiner::<4>::mine(constructor, 4, random_start))
         });
     });
 

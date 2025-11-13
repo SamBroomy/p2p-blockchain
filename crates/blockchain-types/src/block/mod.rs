@@ -312,7 +312,7 @@ mod utils {
 mod tests {
     use super::*;
     use crate::{
-        block::mining::{MinerSimple, MiningStrategy},
+        block::mining::{Miner, MiningStrategy},
         wallet::Wallet,
     };
 
@@ -320,7 +320,7 @@ mod tests {
     fn test_mine_block_with_zero_difficulty() {
         let previous_hash = Hash::from_bytes([0u8; 32]);
         let constructor = BlockConstructor::new(0, &[], previous_hash, None);
-        let block = MinerSimple::mine(constructor, 0, None);
+        let block = Miner::mine(constructor, 0, None);
 
         assert!(block.is_valid());
         assert_eq!(block.previous_hash(), &previous_hash);
@@ -330,7 +330,7 @@ mod tests {
     fn test_mine_block_with_difficulty() {
         let previous_hash = Hash::from_bytes([0u8; 32]);
         let constructor = BlockConstructor::new(0, &[], previous_hash, None);
-        let block = MinerSimple::mine(constructor, 4, None);
+        let block = Miner::mine(constructor, 4, None);
 
         assert!(block.is_valid());
         let hash_bytes = block.hash().as_bytes();
@@ -341,7 +341,7 @@ mod tests {
     fn test_block_hash_matches() {
         let previous_hash = Hash::from_bytes([1u8; 32]);
         let constructor = BlockConstructor::new(1, &[], previous_hash, None);
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert_eq!(block.hash(), &block.inner.hash());
     }
@@ -355,7 +355,7 @@ mod tests {
         let previous_hash = Hash::from_bytes([0u8; 32]);
         let constructor = BlockConstructor::new(0, &[tx], previous_hash, None);
 
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
     }
@@ -364,7 +364,7 @@ mod tests {
     fn test_block_serialization() {
         let previous_hash = Hash::from_bytes([0u8; 32]);
         let constructor = BlockConstructor::new(0, &[], previous_hash, None);
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         let serialized = serde_json::to_string(&block).expect("serialization failed");
         let deserialized: Block =
@@ -382,7 +382,7 @@ mod tests {
 
         let constructor =
             BlockConstructor::new(0, &[], previous_hash, Some(*miner_wallet.address()));
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert_eq!(
@@ -424,7 +424,7 @@ mod tests {
             previous_hash,
             Some(*miner_wallet.address()),
         );
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert_eq!(
@@ -475,7 +475,7 @@ mod tests {
             previous_hash,
             Some(*miner_wallet.address()),
         );
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert_eq!(
@@ -506,7 +506,7 @@ mod tests {
             previous_hash,
             Some(*miner_wallet.address()),
         );
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert!(
@@ -532,7 +532,7 @@ mod tests {
         // Create block without miner address (no reward)
         let constructor =
             BlockConstructor::new(0, &[tx1.clone(), tx2.clone()], previous_hash, None);
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert_eq!(block.transactions().len(), 2);
@@ -550,7 +550,7 @@ mod tests {
     fn test_empty_block_is_valid() {
         let previous_hash = Hash::from_bytes([0u8; 32]);
         let constructor = BlockConstructor::new(0, &[], previous_hash, None);
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert!(block.transactions().is_empty());
@@ -564,7 +564,7 @@ mod tests {
 
         // Valid: empty block
         let constructor = BlockConstructor::new(0, &[], previous_hash, None);
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
         assert!(utils::is_valid_block_reward_structure(block.transactions()));
 
         // Valid: block with reward + user transactions
@@ -572,14 +572,14 @@ mod tests {
         let wallet2 = Wallet::new();
         let tx = wallet1.create_transaction(wallet2.address(), 10);
         let constructor = BlockConstructor::new(0, &[tx], previous_hash, Some(*miner.address()));
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
         assert!(utils::is_valid_block_reward_structure(block.transactions()));
 
         // Valid: block with only user transactions (no reward)
         let tx1 = wallet1.create_transaction(wallet2.address(), 5);
         let tx2 = wallet1.create_transaction(wallet2.address(), 15);
         let constructor = BlockConstructor::new(0, &[tx1, tx2], previous_hash, None);
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
         assert!(utils::is_valid_block_reward_structure(block.transactions()));
     }
 }

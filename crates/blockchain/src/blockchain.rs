@@ -5,8 +5,9 @@ use std::{
 
 use blake3::Hash;
 use blockchain_types::{
-    Block, BlockConstructor, Miner, MinerSimple, MiningStrategy, Transaction,
-    consts::GENESIS_ROOT_HASH, wallet::Address,
+    Block, BlockConstructor, ConstMiner, Miner, MiningStrategy, Transaction,
+    consts::{GENESIS_ROOT_HASH, WALLET_INITIAL_BALANCE},
+    wallet::Address,
 };
 use tracing::info;
 
@@ -65,7 +66,7 @@ impl BlockAddResult {
     }
 }
 
-pub struct BlockChain<M: MiningStrategy = MinerSimple> {
+pub struct BlockChain<M: MiningStrategy = Miner> {
     /// The main accepted chain. Should always be the chain with the highest cumulative difficulty
     main_chain: Chain<RootChain>,
     /// Active forks diverging from the main chain
@@ -79,7 +80,7 @@ pub struct BlockChain<M: MiningStrategy = MinerSimple> {
 }
 
 // Concrete implementation ONLY for the default type
-impl BlockChain<MinerSimple> {
+impl BlockChain<Miner> {
     /// Create a new blockchain with the default `MinerSimple`.
     ///
     /// For other miner types, use:
@@ -92,7 +93,7 @@ impl BlockChain<MinerSimple> {
 }
 
 // You could also add convenience constructors for common types
-impl<const D: usize> BlockChain<Miner<D>> {
+impl<const D: usize> BlockChain<ConstMiner<D>> {
     /// Create a blockchain with const generic difficulty
     pub fn new_miner() -> Self {
         Self::new_with_miner(D)
@@ -394,6 +395,9 @@ impl<M: MiningStrategy> BlockChain<M> {
             self.main_chain.len() >= 1,
             "Main chain must contain at least genesis block"
         );
+        debug_assert!(
+            self.main_chain.blocks().last().unwrap().index() as usize == self.main_chain.len() - 1,
+        );
         self.main_chain.len()
     }
 
@@ -445,7 +449,7 @@ impl<M: MiningStrategy> BlockChain<M> {
         self.main_chain.cumulative_difficulty()
     }
 
-    pub fn get_balance(&self, address: &Address) -> Option<u64> {
+    pub fn get_balance(&self, address: &Address) -> u64 {
         self.main_chain.get_balance(address)
     }
 }
@@ -455,7 +459,7 @@ mod tests {
 
     use std::assert_matches::assert_matches;
 
-    use blockchain_types::{Miner, MinerSimple, MiningStrategy, Transaction, wallet::Wallet};
+    use blockchain_types::{ConstMiner, Miner, MiningStrategy, Transaction, wallet::Wallet};
 
     use super::*;
 
@@ -467,19 +471,19 @@ mod tests {
 
     #[test]
     fn test_explicit_simple_miner() {
-        let blockchain: BlockChain<MinerSimple> = BlockChain::new_with_miner(2);
+        let blockchain: BlockChain<Miner> = BlockChain::new_with_miner(2);
         assert_eq!(blockchain.difficulty, 2);
     }
 
     #[test]
     fn test_const_miner() {
-        let blockchain: BlockChain<Miner<4>> = BlockChain::new_with_miner(4);
+        let blockchain: BlockChain<ConstMiner<4>> = BlockChain::new_with_miner(4);
         assert_eq!(blockchain.difficulty, 4);
     }
 
     #[test]
     fn test_const_miner_with_helper() {
-        let blockchain = BlockChain::<Miner<5>>::new_miner();
+        let blockchain = BlockChain::<ConstMiner<5>>::new_miner();
         assert_eq!(blockchain.difficulty, 5);
     }
 
@@ -489,7 +493,7 @@ mod tests {
         transactions: &[Transaction],
         difficulty: usize,
     ) -> Block {
-        MinerSimple::mine(
+        Miner::mine(
             BlockConstructor::new(index, transactions, previous_hash, None),
             difficulty,
             None,

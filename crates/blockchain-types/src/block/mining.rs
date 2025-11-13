@@ -2,7 +2,52 @@ use tracing::warn;
 
 use crate::{Block, BlockConstructor, block::BlockInner};
 
-fn mine<const D: usize>(
+fn mine(
+    constructor: BlockConstructor,
+    difficulty: usize,
+    initial_nonce: impl Into<Option<u64>>,
+) -> Block {
+    assert!(
+        difficulty <= 64,
+        "Difficulty exceeds maximum possible value of 64"
+    );
+
+    if difficulty >= 16 {
+        warn!(
+            target: "mining",
+            difficulty = difficulty,
+            "Difficulty may be unsolvable in reasonable time (>16 is impractical)"
+        );
+    }
+
+    let initial_nonce = initial_nonce.into().unwrap_or(0);
+
+    #[cfg(feature = "rayon")]
+    {
+        if difficulty < 6 {
+            // For low difficulties, use sequential miner
+            return sequential_mine(constructor, initial_nonce, difficulty);
+        }
+        let batch_size = if difficulty < 8 {
+            1
+        } else if difficulty < 10 {
+            2
+        } else if difficulty < 16 {
+            4
+        } else if difficulty < 24 {
+            8
+        } else {
+            16
+        };
+        parallel_mine(constructor, difficulty, initial_nonce, batch_size)
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        sequential_mine(constructor, initial_nonce, difficulty)
+    }
+}
+
+fn mine_const<const D: usize>(
     constructor: BlockConstructor,
     initial_nonce: impl Into<Option<u64>>,
 ) -> Block {
@@ -34,7 +79,7 @@ fn mine<const D: usize>(
         } else {
             16
         };
-        parallel_mine::<D>(constructor, initial_nonce, batch_size)
+        parallel_mine_const::<D>(constructor, initial_nonce, batch_size)
     }
     #[cfg(not(feature = "rayon"))]
     {
@@ -79,7 +124,57 @@ fn sequential_mine_const<const D: usize>(constructor: BlockConstructor, mut nonc
 }
 
 #[cfg(feature = "rayon")]
-fn parallel_mine<const D: usize>(
+fn parallel_mine(
+    constructor: BlockConstructor,
+    difficulty: usize,
+    initial_nonce: u64,
+    batch_size: u64,
+) -> Block {
+    use rayon::prelude::*;
+    let num_threads = rayon::current_num_threads();
+    let start_nonce = initial_nonce;
+    let chunk_size = u64::MAX / num_threads as u64;
+
+    (0..num_threads)
+        .into_par_iter()
+        .find_map_any(|thread_id| {
+            let mut nonce = start_nonce.wrapping_add(thread_id as u64 * chunk_size);
+            let end_nonce = nonce.wrapping_add(chunk_size);
+
+            while nonce < end_nonce {
+                for batch in 0..batch_size {
+                    let base_nonce = nonce + batch * 8;
+                    let hashes: [blake3::Hash; 8] = std::array::from_fn(|i| {
+                        mining_utils::hash_with_nonce(
+                            constructor.hash_state.clone(),
+                            base_nonce + i as u64,
+                        )
+                    });
+                    if let Some(idx) = hashes
+                        .iter()
+                        .position(|hash| mining_utils::is_valid_target_hash(hash, difficulty))
+                    {
+                        return Some((base_nonce + idx as u64, hashes[idx]));
+                    }
+                }
+                nonce = nonce.wrapping_add(batch_size);
+            }
+            None
+        })
+        .map(|(nonce, hash)| {
+            let inner = BlockInner::new(
+                constructor.index,
+                constructor.transactions.into(),
+                constructor.previous_hash,
+                nonce,
+            );
+            Block::new(inner, hash, difficulty)
+        })
+        .expect("Mining should find a solution for reasonable difficulty")
+}
+
+#[cfg(feature = "rayon")]
+fn parallel_mine_const<const D: usize>(
     constructor: BlockConstructor,
     initial_nonce: u64,
     batch_size: u64,
@@ -149,27 +244,27 @@ pub trait MiningStrategy {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct MinerSimple;
-impl MiningStrategy for MinerSimple {
+pub struct Miner;
+impl MiningStrategy for Miner {
     fn mine(
         constructor: BlockConstructor,
         difficulty: usize,
         initial_nonce: impl Into<Option<u64>>,
     ) -> Block {
-        sequential_mine(constructor, initial_nonce.into().unwrap_or(0), difficulty)
+        mine(constructor, difficulty, initial_nonce)
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Miner<const D: usize>;
+pub struct ConstMiner<const D: usize>;
 
-impl<const D: usize> MiningStrategy for Miner<D> {
+impl<const D: usize> MiningStrategy for ConstMiner<D> {
     fn mine(
         constructor: BlockConstructor,
         _difficulty: usize,
         initial_nonce: impl Into<Option<u64>>,
     ) -> Block {
-        mine::<D>(constructor, initial_nonce)
+        mine_const::<D>(constructor, initial_nonce)
     }
 }
 
@@ -1375,7 +1470,7 @@ mod mining_tests {
     #[test]
     fn test_miner_zero_difficulty() {
         let constructor = create_test_constructor(0, None);
-        let block = MinerSimple::mine(constructor, 0, None);
+        let block = Miner::mine(constructor, 0, None);
 
         assert!(block.is_valid());
         assert_eq!(block.difficulty(), 0);
@@ -1385,7 +1480,7 @@ mod mining_tests {
     #[test]
     fn test_miner_const_zero_difficulty() {
         let constructor = create_test_constructor(0, None);
-        let block = Miner::<0>::mine(constructor, 0, None);
+        let block = ConstMiner::<0>::mine(constructor, 0, None);
 
         assert!(block.is_valid());
         assert_eq!(block.difficulty(), 0);
@@ -1395,7 +1490,7 @@ mod mining_tests {
     #[test]
     fn test_miner_low_difficulty() {
         let constructor = create_test_constructor(0, None);
-        let block = MinerSimple::mine(constructor, 2, None);
+        let block = Miner::mine(constructor, 2, None);
 
         assert!(block.is_valid());
         assert_eq!(block.difficulty(), 2);
@@ -1406,7 +1501,7 @@ mod mining_tests {
     #[test]
     fn test_miner_const_low_difficulty() {
         let constructor = create_test_constructor(0, None);
-        let block = Miner::<2>::mine(constructor, 2, None);
+        let block = ConstMiner::<2>::mine(constructor, 2, None);
 
         assert!(block.is_valid());
         assert_eq!(block.difficulty(), 2);
@@ -1417,7 +1512,7 @@ mod mining_tests {
     #[test]
     fn test_miner_moderate_difficulty() {
         let constructor = create_test_constructor(0, None);
-        let block = MinerSimple::mine(constructor, 4, None);
+        let block = Miner::mine(constructor, 4, None);
 
         assert!(block.is_valid());
         assert_eq!(block.difficulty(), 4);
@@ -1429,7 +1524,7 @@ mod mining_tests {
     #[test]
     fn test_miner_const_moderate_difficulty() {
         let constructor = create_test_constructor(0, None);
-        let block = Miner::<4>::mine(constructor, 4, None);
+        let block = ConstMiner::<4>::mine(constructor, 4, None);
 
         assert!(block.is_valid());
         assert_eq!(block.difficulty(), 4);
@@ -1442,7 +1537,7 @@ mod mining_tests {
     #[test]
     fn test_mined_block_hash_is_valid() {
         let constructor = create_test_constructor(1, None);
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         // Block's hash should be valid (this is guaranteed by Block::new())
         assert!(block.is_valid(), "Mined block should always be valid");
@@ -1457,7 +1552,7 @@ mod mining_tests {
     #[test]
     fn test_miner_const_hash_is_valid() {
         let constructor = create_test_constructor(1, None);
-        let block = Miner::<1>::mine(constructor, 1, None);
+        let block = ConstMiner::<1>::mine(constructor, 1, None);
 
         assert!(block.is_valid(), "Mined block should always be valid");
         assert!(
@@ -1469,7 +1564,7 @@ mod mining_tests {
     #[test]
     fn test_miner_const_hash_matches() {
         let constructor = create_test_constructor(1, None);
-        let block = Miner::<1>::mine(constructor, 1, None);
+        let block = ConstMiner::<1>::mine(constructor, 1, None);
 
         assert_eq!(block.hash(), &block.inner.hash());
     }
@@ -1483,7 +1578,7 @@ mod mining_tests {
         let tx = wallet1.create_transaction(wallet2.address(), 50);
 
         let constructor = create_constructor_with_txs(0, std::slice::from_ref(&tx), None);
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert_eq!(block.transactions().len(), 1);
@@ -1498,7 +1593,7 @@ mod mining_tests {
         let tx2 = wallet1.create_transaction(wallet2.address(), 15);
 
         let constructor = create_constructor_with_txs(0, &[tx1.clone(), tx2.clone()], None);
-        let block = Miner::<2>::mine(constructor, 2, None);
+        let block = ConstMiner::<2>::mine(constructor, 2, None);
 
         assert!(block.is_valid());
         assert_eq!(block.transactions().len(), 2);
@@ -1512,7 +1607,7 @@ mod mining_tests {
     fn test_miner_with_block_reward() {
         let miner_wallet = Wallet::new();
         let constructor = create_test_constructor(0, Some(*miner_wallet.address()));
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert_eq!(block.transactions().len(), 1, "Should have reward tx");
@@ -1527,7 +1622,7 @@ mod mining_tests {
     fn test_miner_const_with_block_reward() {
         let miner_wallet = Wallet::new();
         let constructor = create_test_constructor(0, Some(*miner_wallet.address()));
-        let block = Miner::<1>::mine(constructor, 1, None);
+        let block = ConstMiner::<1>::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert_eq!(block.transactions().len(), 1, "Should have reward tx");
@@ -1552,7 +1647,7 @@ mod mining_tests {
             &[tx1.clone(), tx2.clone()],
             Some(*miner_wallet.address()),
         );
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert_eq!(
@@ -1584,7 +1679,7 @@ mod mining_tests {
             std::slice::from_ref(&tx),
             Some(*miner_wallet.address()),
         );
-        let block = Miner::<2>::mine(constructor, 2, None);
+        let block = ConstMiner::<2>::mine(constructor, 2, None);
 
         assert!(block.is_valid());
         assert_eq!(
@@ -1606,7 +1701,7 @@ mod mining_tests {
     #[test]
     fn test_miner_custom_initial_nonce() {
         let constructor = create_test_constructor(0, None);
-        let block = MinerSimple::mine(constructor, 0, Some(42));
+        let block = Miner::mine(constructor, 0, Some(42));
 
         assert!(block.is_valid());
         // With D=0, any nonce works, so we should get nonce 42
@@ -1616,7 +1711,7 @@ mod mining_tests {
     #[test]
     fn test_miner_const_custom_initial_nonce() {
         let constructor = create_test_constructor(0, None);
-        let block = Miner::<0>::mine(constructor, 0, Some(100));
+        let block = ConstMiner::<0>::mine(constructor, 0, Some(100));
 
         assert!(block.is_valid());
     }
@@ -1628,8 +1723,8 @@ mod mining_tests {
         let constructor1 = create_test_constructor(0, None);
         let constructor2 = create_test_constructor(0, None);
 
-        let block_runtime = MinerSimple::mine(constructor1, 0, Some(0));
-        let block_const = Miner::<0>::mine(constructor2, 0, Some(0));
+        let block_runtime = Miner::mine(constructor1, 0, Some(0));
+        let block_const = ConstMiner::<0>::mine(constructor2, 0, Some(0));
 
         assert_eq!(block_runtime.difficulty(), block_const.difficulty());
         assert!(block_runtime.is_valid());
@@ -1641,8 +1736,8 @@ mod mining_tests {
         let constructor1 = create_test_constructor(0, None);
         let constructor2 = create_test_constructor(0, None);
 
-        let block_runtime = MinerSimple::mine(constructor1, 2, Some(0));
-        let block_const = Miner::<2>::mine(constructor2, 2, Some(0));
+        let block_runtime = Miner::mine(constructor1, 2, Some(0));
+        let block_const = ConstMiner::<2>::mine(constructor2, 2, Some(0));
 
         assert_eq!(block_runtime.difficulty(), block_const.difficulty());
         assert!(block_runtime.is_valid());
@@ -1658,8 +1753,8 @@ mod mining_tests {
         let constructor1 = create_test_constructor(0, None);
         let constructor2 = create_test_constructor(0, None);
 
-        let block_runtime = MinerSimple::mine(constructor1, 4, Some(0));
-        let block_const = Miner::<4>::mine(constructor2, 4, Some(0));
+        let block_runtime = Miner::mine(constructor1, 4, Some(0));
+        let block_const = ConstMiner::<4>::mine(constructor2, 4, Some(0));
 
         assert_eq!(block_runtime.difficulty(), block_const.difficulty());
         assert!(block_runtime.is_valid());
@@ -1677,7 +1772,7 @@ mod mining_tests {
     #[test]
     fn test_miner_empty_block() {
         let constructor = create_test_constructor(0, None);
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert!(block.transactions().is_empty(), "No transactions expected");
@@ -1686,7 +1781,7 @@ mod mining_tests {
     #[test]
     fn test_miner_const_empty_block() {
         let constructor = create_test_constructor(0, None);
-        let block = Miner::<1>::mine(constructor, 1, None);
+        let block = ConstMiner::<1>::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert!(block.transactions().is_empty(), "No transactions expected");
@@ -1702,11 +1797,11 @@ mod mining_tests {
         for &d in &difficulties {
             let constructor = create_test_constructor(0, None);
             let block = match d {
-                0 => Miner::<0>::mine(constructor, 0, None),
-                1 => Miner::<1>::mine(constructor, 1, None),
-                2 => Miner::<2>::mine(constructor, 2, None),
-                3 => Miner::<3>::mine(constructor, 3, None),
-                4 => Miner::<4>::mine(constructor, 4, None),
+                0 => ConstMiner::<0>::mine(constructor, 0, None),
+                1 => ConstMiner::<1>::mine(constructor, 1, None),
+                2 => ConstMiner::<2>::mine(constructor, 2, None),
+                3 => ConstMiner::<3>::mine(constructor, 3, None),
+                4 => ConstMiner::<4>::mine(constructor, 4, None),
                 _ => unreachable!(),
             };
 
@@ -1720,7 +1815,7 @@ mod mining_tests {
         // Mine blocks at different indices
         for index in 0..5u64 {
             let constructor = create_test_constructor(index, None);
-            let block = MinerSimple::mine(constructor, 1, None);
+            let block = Miner::mine(constructor, 1, None);
 
             assert!(block.is_valid());
             assert_eq!(block.index(), index);
@@ -1731,7 +1826,7 @@ mod mining_tests {
     fn test_miner_const_different_indices() {
         for index in 0..5u64 {
             let constructor = create_test_constructor(index, None);
-            let block = Miner::<1>::mine(constructor, 1, None);
+            let block = ConstMiner::<1>::mine(constructor, 1, None);
 
             assert!(block.is_valid());
             assert_eq!(block.index(), index);
@@ -1750,7 +1845,7 @@ mod mining_tests {
 
         for prev_hash in previous_hashes {
             let constructor = BlockConstructor::new(0, &[], prev_hash, None);
-            let block = MinerSimple::mine(constructor, 1, None);
+            let block = Miner::mine(constructor, 1, None);
 
             assert!(block.is_valid());
             assert_eq!(block.previous_hash(), &prev_hash);
@@ -1767,7 +1862,7 @@ mod mining_tests {
 
         for prev_hash in previous_hashes {
             let constructor = BlockConstructor::new(0, &[], prev_hash, None);
-            let block = Miner::<2>::mine(constructor, 2, None);
+            let block = ConstMiner::<2>::mine(constructor, 2, None);
 
             assert!(block.is_valid());
             assert_eq!(block.previous_hash(), &prev_hash);
@@ -1779,7 +1874,7 @@ mod mining_tests {
     #[test]
     fn test_mined_block_serialization_roundtrip() {
         let constructor = create_test_constructor(0, None);
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         let serialized = serde_json::to_string(&block).expect("Serialization failed");
         let deserialized: Block =
@@ -1799,7 +1894,7 @@ mod mining_tests {
         let tx = wallet1.create_transaction(wallet2.address(), 25);
 
         let constructor = create_constructor_with_txs(0, &[tx], Some(*miner_wallet.address()));
-        let block = Miner::<2>::mine(constructor, 2, None);
+        let block = ConstMiner::<2>::mine(constructor, 2, None);
 
         let serialized = serde_json::to_string(&block).expect("Serialization failed");
         let deserialized: Block =
@@ -1820,7 +1915,7 @@ mod mining_tests {
     fn test_miner_const_parallel_mining_d5() {
         // D=6 triggers parallel path in MinerConst
         let constructor = create_test_constructor(0, None);
-        let block = Miner::<5>::mine(constructor, 5, None);
+        let block = ConstMiner::<5>::mine(constructor, 5, None);
 
         assert!(block.is_valid());
         assert_eq!(block.difficulty(), 5);
@@ -1847,7 +1942,7 @@ mod mining_tests {
             std::slice::from_ref(&tx),
             Some(*miner_wallet.address()),
         );
-        let block = Miner::<5>::mine(constructor, 5, None);
+        let block = ConstMiner::<5>::mine(constructor, 5, None);
 
         assert!(block.is_valid());
         assert_eq!(block.transactions().len(), 2); // reward + user tx
@@ -1867,7 +1962,7 @@ mod mining_tests {
         }
 
         let constructor = create_test_constructor(0, None);
-        let block = mine_with_strategy::<MinerSimple>(constructor, 2);
+        let block = mine_with_strategy::<Miner>(constructor, 2);
 
         assert!(block.is_valid());
         assert_eq!(block.difficulty(), 2);
@@ -1883,7 +1978,7 @@ mod mining_tests {
         }
 
         let constructor = create_test_constructor(0, None);
-        let block = mine_with_strategy::<Miner<4>>(constructor, 4);
+        let block = mine_with_strategy::<ConstMiner<4>>(constructor, 4);
 
         assert!(block.is_valid());
         assert_eq!(block.difficulty(), 4);
@@ -1906,7 +2001,7 @@ mod mining_tests {
 
         let constructor =
             create_constructor_with_txs(0, &transactions, Some(*miner_wallet.address()));
-        let block = MinerSimple::mine(constructor, 1, None);
+        let block = Miner::mine(constructor, 1, None);
 
         assert!(block.is_valid());
         assert_eq!(block.transactions().len(), MAX_TRANSACTIONS_PER_BLOCK);
@@ -1931,7 +2026,7 @@ mod mining_tests {
 
         let constructor =
             create_constructor_with_txs(0, &transactions, Some(*miner_wallet.address()));
-        let block = Miner::<2>::mine(constructor, 2, None);
+        let block = ConstMiner::<2>::mine(constructor, 2, None);
 
         assert!(block.is_valid());
         assert_eq!(block.transactions().len(), MAX_TRANSACTIONS_PER_BLOCK);

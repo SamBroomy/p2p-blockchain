@@ -44,7 +44,7 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rayon = "1.11"
-
+rustyline = "17.0"
 blockchain-types = { path = "crates/blockchain-types" }
 blockchain = { path = "crates/blockchain" }
 mempool = { path = "crates/mempool" }

@@ -5,6 +5,6 @@ pub mod wallet;
 
 pub use block::{
     Block, BlockConstructor,
-    mining::{Miner, MinerSimple, MiningStrategy},
+    mining::{ConstMiner, Miner, MiningStrategy},
 };
 pub use transaction::Transaction;

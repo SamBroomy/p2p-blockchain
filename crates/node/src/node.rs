@@ -1,9 +1,10 @@
+use core::fmt;
 use std::{collections::HashMap, error::Error, time::Duration};
 
 use blake3::Hash;
 use blockchain::{BlockAddResult, BlockChain};
 use blockchain_types::{
-    Block, BlockConstructor, Miner, Transaction,
+    Block, BlockConstructor, ConstMiner, Miner, Transaction,
     wallet::{Address, Wallet},
 };
 use libp2p::{
@@ -17,11 +18,10 @@ use network::{
     BlockchainBehaviour, BlockchainBehaviourEvent, NetworkMessage, Swarm, SwarmEvent, SyncRequest,
     SyncResponse, TOPIC_BLOCKS, TOPIC_TRANSACTIONS,
 };
-use tokio::{io, io::AsyncBufReadExt};
 use tracing::{debug, info, warn};
 
 pub struct Node {
-    pub blockchain: BlockChain<Miner<5>>,
+    pub blockchain: BlockChain<Miner>,
     pub mempool: Mempool,
     wallet: Wallet,
     pub swarm: Swarm<BlockchainBehaviour>,
@@ -56,7 +56,7 @@ impl Node {
         // swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
         swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
-        let blockchain: BlockChain<Miner<5>> = BlockChain::<Miner<5>>::new_miner();
+        let blockchain: BlockChain<Miner> = BlockChain::new(5);
 
         Ok(Self {
             blockchain,
@@ -71,18 +71,20 @@ impl Node {
     /// Main event loop
     pub async fn run(&mut self) {
         // TODO: on startup, get the blockchain state from peers (first sync)
-        // Read full lines from stdin
-        let mut _stdin = io::BufReader::new(io::stdin()).lines();
 
         // Timer for periodic sync checks
-        let mut sync_interval = tokio::time::interval(Duration::from_secs(30));
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(10));
+
+        debug!("Node event loop started");
 
         loop {
             tokio::select! {
                 _ = sync_interval.tick() => {
+                    debug!("Performing periodic sync check");
                     self.sync_check();
                 }
                 event = self.swarm.select_next_some() => {
+                    debug!("Swarm event received");
                     self.handle_swarm_event(event);
 
                 }
@@ -106,6 +108,7 @@ impl Node {
                         for (peer_id, _) in peers {
                             debug!(peer_id = %peer_id, "mDNS discovered a new peer");
                             self.swarm.behaviour_mut().add_peer(&peer_id);
+                            self.request_peer_status(&peer_id);
                         }
                     }
 
@@ -238,15 +241,14 @@ impl Node {
                     );
                     let our_height = self.blockchain.main_chain_len() as u64;
                     let our_difficulty = self.blockchain.cumulative_difficulty();
-
+                    // TODO
                     if height > our_height || cumulative_difficulty > our_difficulty {
-                        warn!("Peer is ahead, syncing...");
-                        warn!(
+                        info!(
                             peer_height = height,
                             peer_difficulty = cumulative_difficulty,
                             our_height = our_height,
                             our_difficulty = our_difficulty,
-                            "Requesting missing blocks"
+                            "Peer is ahead, requesting blocks"
                         );
                         // Request blocks from our height to their height
                         self.request_block_range(our_height, height);
@@ -306,9 +308,10 @@ impl Node {
     }
 
     /// Periodically check if we're in sync
-    fn sync_check(&mut self) {
+    pub fn sync_check(&mut self) {
+        debug!("Running sync check");
         // Check 1: Too many orphans?
-        if self.blockchain.orphan_count() > 3 {
+        if self.blockchain.orphan_count() > 2 {
             debug!(
                 orphan_count = self.blockchain.orphan_count(),
                 "Orphan count high, requesting missing blocks"
@@ -318,7 +321,7 @@ impl Node {
         }
 
         // Check 2: Ask a random peer for their status
-        self.request_peer_status();
+        self.request_random_peer_status();
     }
 
     pub fn list_peers(&self) -> impl Iterator<Item = &PeerId> + '_ {
@@ -330,21 +333,25 @@ impl Node {
         self.list_peers().choose(&mut rand::thread_rng()).copied()
     }
 
-    /// Request status from ONE random peer
-    fn request_peer_status(&mut self) {
-        let random_peer = self.get_random_peer();
-        let Some(peer) = random_peer else {
-            warn!("No peers to request status from");
-            return;
-        };
+    fn request_peer_status(&mut self, peer: &PeerId) {
         info!(peer = %peer, "Requesting status from peer");
         let request_id = self
             .swarm
             .behaviour_mut()
             .request_response
-            .send_request(&peer, SyncRequest::Status);
+            .send_request(peer, SyncRequest::Status);
         self.pending_requests
             .insert(request_id, SyncRequestType::Status);
+    }
+
+    /// Request status from ONE random peer
+    fn request_random_peer_status(&mut self) {
+        let random_peer = self.get_random_peer();
+        let Some(peer) = random_peer else {
+            debug!("No peers to request status from");
+            return;
+        };
+        self.request_peer_status(&peer);
     }
 
     /// Request specific blocks from ONE random peer
@@ -422,6 +429,7 @@ impl Node {
         let bytes = msg.to_bytes()?;
 
         self.swarm.behaviour_mut().publish(TOPIC_BLOCKS, bytes)?;
+
         Ok(())
     }
 
@@ -432,21 +440,40 @@ impl Node {
         receiver_address: &Address,
         amount: u64,
     ) -> Result<Transaction, NodeError> {
-        // 1. Create the transaction
-        let tx = self.wallet.create_transaction(receiver_address, amount);
-        // 2. Try to locally validate before broadcasting
-        if !self.blockchain.validate_transaction(&tx) {
-            return Err(NodeError::InsufficientBalance);
+        // 1. Check available balance accounting for pending transactions
+        let balance_info = self.get_balance_info();
+        if amount > balance_info.available {
+            warn!(
+                amount = amount,
+                available = balance_info.available,
+                "Insufficient balance to send transaction"
+            );
+            return Err(NodeError::InsufficientBalance {
+                requested: amount,
+                available: balance_info.available,
+                pending: balance_info.pending_sends,
+            });
         }
-        // 3. Add to the local mempool
+        // 2. Create the transaction
+        let tx = self.wallet.create_transaction(receiver_address, amount);
+        // 3. Double-check against blockchain state (should always pass after step 1)
+        // This catches race conditions or state inconsistencies
+        debug_assert!(
+            self.blockchain.validate_transaction(&tx),
+            "Transaction should be valid after balance check"
+        );
+        // 4. Add to the local mempool
         self.mempool.add_transaction(tx.clone());
-        // 4. Broadcast to the network
-        self.broadcast_transaction(tx.clone())?;
+        // 5. Broadcast to network (best-effort, ignore no-peers errors)
+
+        if let Err(e) = self.broadcast_transaction(tx.clone()) {
+            debug!(error = %e, "Failed to broadcast block (no peers?)");
+        }
         info!(
             tx_hash = ?tx.hash(),
             receiver_address = %receiver_address,
             amount = amount,
-            "Created and broadcasted transaction"
+            "Transaction created and broadcast"
         );
         Ok(tx)
     }
@@ -480,7 +507,9 @@ impl Node {
         match self.blockchain.add_block(mined_block.clone()) {
             BlockAddResult::Added { .. } => {
                 // 5. Broadcast to network
-                self.broadcast_block(mined_block.clone())?;
+                if let Err(e) = self.broadcast_block(mined_block.clone()) {
+                    debug!(error = %e, "Failed to broadcast block");
+                }
                 Ok(mined_block)
             }
             BlockAddResult::Orphaned { missing_parent } => {
@@ -499,15 +528,59 @@ impl Node {
         *self.wallet.address()
     }
 
-    pub fn get_balance(&self) -> Option<u64> {
-        self.blockchain.get_balance(self.wallet.address())
+    pub fn get_balance_info(&self) -> BalanceInfo {
+        let confirmed = self.blockchain.get_balance(self.wallet.address());
+
+        let pending_sends = self
+            .mempool
+            .pending_transactions()
+            .filter_map(|tx| {
+                if let Some(addr) = tx.sender()
+                    && addr == self.wallet.address()
+                {
+                    Some(tx.amount())
+                } else {
+                    None
+                }
+            })
+            .sum();
+        let available = confirmed.saturating_sub(pending_sends);
+
+        BalanceInfo {
+            confirmed,
+            pending_sends,
+            available,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BalanceInfo {
+    pub confirmed: u64,
+    pub pending_sends: u64,
+    pub available: u64,
+}
+
+impl fmt::Display for BalanceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Confirmed: {}, Pending Sends: {}, Available: {}",
+            self.confirmed, self.pending_sends, self.available
+        )
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error("Insufficient balance")]
-    InsufficientBalance,
+    InsufficientBalance {
+        requested: u64,
+        available: u64,
+        pending: u64,
+    },
+    #[error("Transaction validation failed")]
+    TransactionValidationFailed,
     #[error("Block rejected")]
     BlockRejected,
     #[error("Serialization error: {0}")]

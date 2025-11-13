@@ -141,12 +141,12 @@ impl Default for OrphanPool {
 
 #[cfg(test)]
 mod tests {
-    use blockchain_types::{BlockConstructor, MinerSimple, MiningStrategy};
+    use blockchain_types::{BlockConstructor, Miner, MiningStrategy};
 
     use super::*;
 
     fn create_test_block(index: u64, previous_hash: Hash) -> Block {
-        MinerSimple::mine(
+        Miner::mine(
             BlockConstructor::new(index, &[], previous_hash, None),
             0,
             None,

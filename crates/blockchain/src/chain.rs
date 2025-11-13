@@ -183,8 +183,12 @@ impl<T: ChainType> Chain<T> {
         self.root_block().hash()
     }
 
-    pub fn get_balance(&self, address: &Address) -> Option<Balance> {
+    fn get_onchain_balance(&self, address: &Address) -> Option<Balance> {
         self.balances.get(address).copied()
+    }
+
+    pub fn get_balance(&self, address: &Address) -> Balance {
+        self.get_onchain_balance(address).unwrap_or(INITIAL_BALANCE)
     }
 
     pub fn cumulative_difficulty(&self) -> u128 {
@@ -261,8 +265,7 @@ impl<T: ChainType> Chain<T> {
     pub fn validate_transaction(&self, tx: &Transaction) -> bool {
         let sender_balance = tx
             .sender()
-            .and_then(|addr| self.get_balance(addr))
-            .unwrap_or(INITIAL_BALANCE);
+            .map_or(INITIAL_BALANCE, |addr| self.get_balance(addr));
         sender_balance >= tx.amount()
     }
 }
@@ -600,7 +603,7 @@ impl Chain<ForkChain> {
 
 #[cfg(test)]
 mod tests {
-    use blockchain_types::{BlockConstructor, MinerSimple, MiningStrategy, wallet::Wallet};
+    use blockchain_types::{BlockConstructor, Miner, MiningStrategy, wallet::Wallet};
 
     use super::*;
 
@@ -610,7 +613,7 @@ mod tests {
         transactions: &[Transaction],
         difficulty: usize,
     ) -> Block {
-        MinerSimple::mine(
+        Miner::mine(
             BlockConstructor::new(index, transactions, previous_hash, None),
             difficulty,
             None,
@@ -684,9 +687,9 @@ mod tests {
         // Alice: 100 - 30 = 70
         // Bob: 100 + 30 = 130
         // Charlie: 100
-        let alice_balance_root = chain.get_balance(alice.address()).unwrap_or(100);
-        let bob_balance_root = chain.get_balance(bob.address()).unwrap_or(100);
-        let charlie_balance_root = chain.get_balance(charlie.address()).unwrap_or(100);
+        let alice_balance_root = chain.get_balance(alice.address());
+        let bob_balance_root = chain.get_balance(bob.address());
+        let charlie_balance_root = chain.get_balance(charlie.address());
 
         assert_eq!(
             alice_balance_root, 70,
@@ -708,9 +711,9 @@ mod tests {
         // Alice: 100 - 30 - 20 = 50
         // Bob: 100 + 30 - 10 = 120
         // Charlie: 100 + 20 + 10 = 130
-        let alice_balance_fork = fork.get_balance(alice.address()).unwrap_or(100);
-        let bob_balance_fork = fork.get_balance(bob.address()).unwrap_or(100);
-        let charlie_balance_fork = fork.get_balance(charlie.address()).unwrap_or(100);
+        let alice_balance_fork = fork.get_balance(alice.address());
+        let bob_balance_fork = fork.get_balance(bob.address());
+        let charlie_balance_fork = fork.get_balance(charlie.address());
 
         assert_eq!(
             alice_balance_fork, 50,
