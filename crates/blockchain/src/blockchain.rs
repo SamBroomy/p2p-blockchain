@@ -6,9 +6,9 @@ use std::{
 use blake3::Hash;
 use blockchain_types::{
     Block, BlockConstructor, ConstMiner, Miner, MiningStrategy, Transaction,
-    consts::{GENESIS_ROOT_HASH, WALLET_INITIAL_BALANCE},
-    wallet::Address,
+    consts::GENESIS_ROOT_HASH, wallet::Address,
 };
+use rand::{RngCore, rngs::OsRng};
 use tracing::info;
 
 use crate::{
@@ -102,7 +102,7 @@ impl<const D: usize> BlockChain<ConstMiner<D>> {
 
 impl<M: MiningStrategy> BlockChain<M> {
     pub fn mine(&self, constructor: BlockConstructor) -> Block {
-        let random_nonce = rand::random::<u64>();
+        let random_nonce = OsRng.next_u64();
         M::mine(constructor, self.difficulty, Some(random_nonce))
     }
 

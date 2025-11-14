@@ -172,7 +172,7 @@ mod utils {
     use super::{
         DateTime, Hash, Hasher, InnerTransaction, Signature, Transaction, TransactionType, Utc,
     };
-    use crate::consts::BLOCK_REWARD_SIGNATURE_BYTES;
+    use crate::consts::{BLOCK_REWARD_SIGNATURE_BYTES, MAX_FUTURE_TIMESTAMP_DRIFT, MAX_PAST_TIMESTAMP_DRIFT};
 
     #[inline]
     fn hash_transaction_type(hasher: &mut Hasher, tx_type: &TransactionType) {
@@ -310,7 +310,33 @@ mod utils {
         is_valid_transaction_hash(hash, inner_tx, signature)
     }
 
+    fn is_valid_timestamp(timestamp: &DateTime<Utc>) -> bool {
+        let now = Utc::now();
+        let diff = now.signed_duration_since(*timestamp).num_seconds();
+
+        // Check if timestamp is not too far in the future
+        if diff < -MAX_FUTURE_TIMESTAMP_DRIFT {
+            return false;
+        }
+
+        // Check if timestamp is not too far in the past (except for block rewards)
+        if diff > MAX_PAST_TIMESTAMP_DRIFT {
+            return false;
+        }
+
+        true
+    }
+
     pub fn validate_transaction(tx: &Transaction) -> Result<(), serde_valid::validation::Error> {
+        // Skip timestamp validation for block rewards (they're created by miners)
+        if !matches!(tx.inner.tx_type, TransactionType::BlockReward { .. })
+            && !is_valid_timestamp(&tx.inner.timestamp)
+        {
+            return Err(serde_valid::validation::Error::Custom(
+                "Invalid transaction timestamp: too far in past or future".to_owned(),
+            ));
+        }
+
         if is_valid_transaction(&tx.inner, &tx.signature, &tx.hash) {
             Ok(())
         } else {
@@ -489,5 +515,94 @@ mod tests {
         // But both should be valid block rewards
         assert!(reward1.is_block_reward());
         assert!(reward2.is_block_reward());
+    }
+
+    #[test]
+    fn test_timestamp_validation_accepts_recent() {
+        // Transactions with current timestamp should be accepted
+        let mut csprng = OsRng;
+        let sk = SigningKey::generate(&mut csprng);
+        let sender_pk = Address::from_verifying_key(sk.verifying_key());
+        let sender_sk = PrivateKey::from_singing_key(sk);
+        let receiver_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+
+        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, &sender_sk);
+
+        // Should pass validation (uses serde_valid under the hood)
+        let serialized = serde_json::to_string(&tx).expect("serialization failed");
+        let result: Result<Transaction, _> = serde_json::from_str(&serialized);
+        assert!(result.is_ok(), "Recent transaction should pass validation");
+    }
+
+    #[test]
+    fn test_timestamp_validation_rejects_far_future() {
+        use chrono::Duration;
+
+        // Create a transaction with a far-future timestamp manually
+        let mut csprng = OsRng;
+        let sk = SigningKey::generate(&mut csprng);
+        let sender_pk = Address::from_verifying_key(sk.verifying_key());
+        let sender_sk = PrivateKey::from_singing_key(sk);
+        let receiver_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+
+        // Create inner transaction with far-future timestamp
+        let far_future = Utc::now() + Duration::hours(3); // 3 hours in future (> 2 hour limit)
+        let inner = InnerTransaction {
+            tx_type: TransactionType::Transfer {
+                sender: sender_pk,
+                receiver: receiver_pk,
+            },
+            amount: 100,
+            timestamp: far_future,
+        };
+
+        let message_hash = inner.hash();
+        let signature = sender_sk.sign(message_hash.as_bytes());
+        let transaction_hash = utils::hash_transaction_complete(Hasher::new(), &inner, signature);
+
+        // Manually create transaction JSON with far-future timestamp
+        let sig_bytes: Vec<u8> = signature.to_bytes().to_vec();
+        let json_str = format!(
+            r#"{{
+                "type": "transfer",
+                "sender": {},
+                "receiver": {},
+                "amount": 100,
+                "timestamp": "{}",
+                "signature": {},
+                "hash": "{}"
+            }}"#,
+            serde_json::to_string(&sender_pk).unwrap(),
+            serde_json::to_string(&receiver_pk).unwrap(),
+            far_future.to_rfc3339(),
+            serde_json::to_string(&sig_bytes).unwrap(),
+            transaction_hash.to_hex()
+        );
+
+        // Should fail validation due to timestamp
+        let result: Result<Transaction, _> = serde_json::from_str(&json_str);
+        assert!(
+            result.is_err(),
+            "Transaction with far-future timestamp should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_block_reward_skips_timestamp_validation() {
+        // Block rewards should not be subject to timestamp validation
+        // (they're created by miners at block creation time)
+        let miner_pk =
+            Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
+        let reward = TransactionConstructor::block_reward(&miner_pk, 50);
+
+        // Should always pass validation regardless of timestamp
+        let serialized = serde_json::to_string(&reward).expect("serialization failed");
+        let result: Result<Transaction, _> = serde_json::from_str(&serialized);
+        assert!(
+            result.is_ok(),
+            "Block reward should pass validation regardless of timestamp"
+        );
     }
 }

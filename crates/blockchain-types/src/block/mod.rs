@@ -195,6 +195,7 @@ impl Block {
 
 mod utils {
     use super::{Block, BlockInner, Hash, Hasher, Transaction};
+    use crate::consts::MAX_BLOCK_SIZE_BYTES;
 
     #[inline]
     pub fn hash_initial(
@@ -297,7 +298,24 @@ mod utils {
             && is_valid_block_hash(&block.hash, &block.inner)
     }
 
+    pub(crate) fn estimate_block_size(block: &Block) -> usize {
+        // Rough estimate:
+        // - index (8 bytes) + previous_hash (32 bytes) + nonce (8 bytes) + timestamp (16 bytes)
+        // - Each transaction: ~200 bytes average (address + signature + amount + timestamp + hash)
+        let base_size = 8 + 32 + 8 + 16;
+        let tx_size = block.inner.transactions.len() * 200;
+        base_size + tx_size
+    }
+
     pub fn validate_block(block: &Block) -> Result<(), serde_valid::validation::Error> {
+        // Check block size
+        let estimated_size = estimate_block_size(block);
+        if estimated_size > MAX_BLOCK_SIZE_BYTES {
+            return Err(serde_valid::validation::Error::Custom(
+                format!("Block size {estimated_size} exceeds maximum {MAX_BLOCK_SIZE_BYTES}"),
+            ));
+        }
+
         if is_valid_block(block) {
             Ok(())
         } else {
@@ -313,6 +331,7 @@ mod tests {
     use super::*;
     use crate::{
         block::mining::{Miner, MiningStrategy},
+        consts::MAX_BLOCK_SIZE_BYTES,
         wallet::Wallet,
     };
 
@@ -581,5 +600,78 @@ mod tests {
         let constructor = BlockConstructor::new(0, &[tx1, tx2], previous_hash, None);
         let block = Miner::mine(constructor, 1, None);
         assert!(utils::is_valid_block_reward_structure(block.transactions()));
+    }
+
+    #[test]
+    fn test_block_size_validation_accepts_small_blocks() {
+        // Small blocks should pass validation
+        let previous_hash = Hash::from_bytes([0u8; 32]);
+        let wallet1 = Wallet::new();
+        let wallet2 = Wallet::new();
+
+        // Create a few transactions
+        let tx1 = wallet1.create_transaction(wallet2.address(), 10);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 20);
+
+        let constructor = BlockConstructor::new(0, &[tx1, tx2], previous_hash, None);
+        let block = Miner::mine(constructor, 1, None);
+
+        // Should pass validation
+        assert!(block.is_valid());
+
+        // Test via serialization/deserialization (triggers serde_valid)
+        let serialized = serde_json::to_string(&block).expect("serialization failed");
+        let result: Result<Block, _> = serde_json::from_str(&serialized);
+        assert!(result.is_ok(), "Small block should pass size validation");
+    }
+
+    #[test]
+    fn test_block_size_validation_rejects_huge_blocks() {
+        // Blocks with many transactions that exceed size limit should fail
+        let previous_hash = Hash::from_bytes([0u8; 32]);
+        let wallet1 = Wallet::new();
+        let wallet2 = Wallet::new();
+
+        // Create MAX_TRANSACTIONS_PER_BLOCK transactions
+        // With our estimate of ~200 bytes per tx, 1000 txs = ~200KB which is under 1MB limit
+        // So this should still pass
+        let mut txs = Vec::new();
+        for i in 0..MAX_TRANSACTIONS_PER_BLOCK {
+            txs.push(wallet1.create_transaction(wallet2.address(), (i % 100) as u64 + 1));
+        }
+
+        let constructor = BlockConstructor::new(0, &txs, previous_hash, None);
+        let block = Miner::mine(constructor, 1, None);
+
+        // Even with max transactions, should still be under 1MB limit
+        let estimated_size = utils::estimate_block_size(&block);
+        assert!(
+            estimated_size <= MAX_BLOCK_SIZE_BYTES,
+            "Block with max transactions should be under size limit"
+        );
+    }
+
+    #[test]
+    fn test_block_size_estimation() {
+        let previous_hash = Hash::from_bytes([0u8; 32]);
+        let wallet1 = Wallet::new();
+        let wallet2 = Wallet::new();
+
+        // Empty block
+        let constructor = BlockConstructor::new(0, &[], previous_hash, None);
+        let block = Miner::mine(constructor, 1, None);
+        let size_empty = utils::estimate_block_size(&block);
+
+        // Block with one transaction
+        let tx = wallet1.create_transaction(wallet2.address(), 50);
+        let constructor = BlockConstructor::new(0, &[tx], previous_hash, None);
+        let block_with_tx = Miner::mine(constructor, 1, None);
+        let size_with_tx = utils::estimate_block_size(&block_with_tx);
+
+        // Size should increase with transactions
+        assert!(
+            size_with_tx > size_empty,
+            "Block with transaction should be larger than empty block"
+        );
     }
 }

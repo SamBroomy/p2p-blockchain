@@ -4,7 +4,8 @@ use std::{collections::HashMap, error::Error, time::Duration};
 use blake3::Hash;
 use blockchain::{BlockAddResult, BlockChain};
 use blockchain_types::{
-    Block, BlockConstructor, ConstMiner, Miner, Transaction,
+    Block, BlockConstructor, Miner, Transaction,
+    consts::MAX_BLOCKS_PER_REQUEST,
     wallet::{Address, Wallet},
 };
 use libp2p::{
@@ -211,8 +212,24 @@ impl Node {
             }
             SyncRequest::BlockRange { from, to } => {
                 info!(from = from, to = to, "Peer requested block range");
-                let blocks = self.blockchain.get_blocks_in_range(from, to);
-                SyncResponse::Blocks(blocks)
+                // Validate request size to prevent DoS attacks
+                if to < from {
+                    warn!(from = from, to = to, "Invalid block range: to < from");
+                    SyncResponse::Blocks(vec![])
+                } else if to - from > MAX_BLOCKS_PER_REQUEST {
+                    warn!(
+                        from = from,
+                        to = to,
+                        max = MAX_BLOCKS_PER_REQUEST,
+                        "Block range too large, capping to maximum"
+                    );
+                    let capped_to = from + MAX_BLOCKS_PER_REQUEST;
+                    let blocks = self.blockchain.get_blocks_in_range(from, capped_to);
+                    SyncResponse::Blocks(blocks)
+                } else {
+                    let blocks = self.blockchain.get_blocks_in_range(from, to);
+                    SyncResponse::Blocks(blocks)
+                }
             }
         };
         self.swarm
