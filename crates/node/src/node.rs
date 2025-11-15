@@ -21,6 +21,12 @@ use network::{
 };
 use tracing::{debug, info, warn};
 
+/// Maximum blocks to request in a single batch during sync
+const SYNC_BATCH_SIZE: u64 = 100;
+
+/// Timeout for waiting for initial peer discovery (seconds)
+const PEER_DISCOVERY_TIMEOUT_SECS: u64 = 30;
+
 pub struct Node {
     pub blockchain: BlockChain<Miner>,
     pub mempool: Mempool,
@@ -28,12 +34,27 @@ pub struct Node {
     pub swarm: Swarm<BlockchainBehaviour>,
     // Trackpending requests (for responses)
     pending_requests: HashMap<OutboundRequestId, SyncRequestType>,
+    sync_state: SyncState,
 }
 
 #[derive(Debug)]
 enum SyncRequestType {
     Status,
     Blocks(Vec<Hash>),
+    BlockRange { from: u64, to: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SyncState {
+    /// Node just started, waiting for peers
+    NotSynced,
+    /// Actively syncing to catch up with network
+    Syncing {
+        target_height: u64,
+        current_batch_start: u64,
+    },
+    /// Caught up with network
+    Synced,
 }
 
 impl Node {
@@ -66,12 +87,44 @@ impl Node {
             swarm,
 
             pending_requests: HashMap::new(),
+            sync_state: SyncState::NotSynced,
         })
     }
 
     /// Main event loop
     pub async fn run(&mut self) {
-        // TODO: on startup, get the blockchain state from peers (first sync)
+        // Bootstrap sync: wait for initial peer discovery
+        info!("Waiting for initial peer discovery...");
+        let discovery_timeout = tokio::time::sleep(Duration::from_secs(PEER_DISCOVERY_TIMEOUT_SECS));
+        tokio::pin!(discovery_timeout);
+
+        let mut peer_discovered = false;
+
+        // Wait for first peer or timeout
+        loop {
+            tokio::select! {
+                _ = &mut discovery_timeout => {
+                    warn!("Peer discovery timeout - proceeding in solo mode");
+                    self.sync_state = SyncState::Synced;
+                    break;
+                }
+                event = self.swarm.select_next_some() => {
+                    match &event {
+                        SwarmEvent::Behaviour(BlockchainBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) if !peers.is_empty() => {
+                            info!(peer_count = peers.len(), "Discovered initial peers");
+                            peer_discovered = true;
+                        }
+                        _ => {}
+                    }
+                    self.handle_swarm_event(event);
+
+                    if peer_discovered {
+                        info!("Initial peer discovered, requesting sync status");
+                        break;
+                    }
+                }
+            }
+        }
 
         // Timer for periodic sync checks
         let mut sync_interval = tokio::time::interval(Duration::from_secs(10));
@@ -258,27 +311,65 @@ impl Node {
                     );
                     let our_height = self.blockchain.main_chain_len() as u64;
                     let our_difficulty = self.blockchain.cumulative_difficulty();
-                    // TODO
                     if height > our_height || cumulative_difficulty > our_difficulty {
                         info!(
                             peer_height = height,
                             peer_difficulty = cumulative_difficulty,
                             our_height = our_height,
                             our_difficulty = our_difficulty,
-                            "Peer is ahead, requesting blocks"
+                            "Peer is ahead, entering sync mode"
                         );
-                        // Request blocks from our height to their height
-                        self.request_block_range(our_height, height);
+
+                        // Enter syncing state and request first batch
+                        self.sync_state = SyncState::Syncing {
+                            target_height: height,
+                            current_batch_start: our_height,
+                        };
+
+                        // Request first batch of blocks
+                        let batch_end = (our_height + SYNC_BATCH_SIZE).min(height);
+                        self.request_block_range(our_height, batch_end);
+                    } else {
+                        // We're caught up
+                        if self.sync_state != SyncState::Synced {
+                            info!("Caught up with network");
+                            self.sync_state = SyncState::Synced;
+                        }
                     }
                 }
-                (SyncRequestType::Blocks(_hashes), SyncResponse::Blocks(blocks)) => {
-                    // TODO: Check we got the blocks we requested
+                (SyncRequestType::Blocks(requested_hashes), SyncResponse::Blocks(blocks)) => {
+                    // Validate: only process blocks that were requested
+                    let requested_set: std::collections::HashSet<_> =
+                        requested_hashes.iter().collect();
+
+                    let mut valid_blocks = Vec::new();
+                    let mut invalid_count = 0;
+
+                    for block in blocks {
+                        if requested_set.contains(block.hash()) {
+                            valid_blocks.push(block);
+                        } else {
+                            invalid_count += 1;
+                            warn!(
+                                hash = ?block.hash(),
+                                "Received unrequested block, ignoring"
+                            );
+                        }
+                    }
+
+                    if invalid_count > 0 {
+                        warn!(
+                            invalid_count = invalid_count,
+                            "Peer sent unrequested blocks"
+                        );
+                    }
 
                     info!(
-                        blocks_received = blocks.len(),
-                        "Received blocks in response"
+                        blocks_received = valid_blocks.len(),
+                        "Received valid blocks in response"
                     );
-                    for block in blocks {
+
+                    for block in valid_blocks {
                         match self.blockchain.add_block(block) {
                             BlockAddResult::Added { processed_orphans } => {
                                 info!(
@@ -291,6 +382,86 @@ impl Node {
                                 self.request_blocks(vec![missing_parent]);
                             }
                             BlockAddResult::Rejected(_) => {}
+                        }
+                    }
+                }
+                (
+                    SyncRequestType::BlockRange { from, to },
+                    SyncResponse::Blocks(blocks),
+                ) => {
+                    // Validate: blocks must be within requested range
+                    let mut valid_blocks = Vec::new();
+                    let mut invalid_count = 0;
+
+                    for block in blocks {
+                        let index = block.index();
+                        if index >= from && index < to {
+                            valid_blocks.push(block);
+                        } else {
+                            invalid_count += 1;
+                            warn!(
+                                index = index,
+                                expected_range = format!("[{}, {})", from, to),
+                                "Received out-of-range block, ignoring"
+                            );
+                        }
+                    }
+
+                    if invalid_count > 0 {
+                        warn!(
+                            invalid_count = invalid_count,
+                            "Peer sent out-of-range blocks"
+                        );
+                    }
+
+                    info!(
+                        blocks_received = valid_blocks.len(),
+                        range = format!("[{}, {})", from, to),
+                        "Received valid blocks in range"
+                    );
+
+                    for block in valid_blocks {
+                        match self.blockchain.add_block(block) {
+                            BlockAddResult::Added { processed_orphans } => {
+                                info!(
+                                    processed_orphans = processed_orphans,
+                                    "Added block, processed orphans"
+                                );
+                            }
+                            BlockAddResult::Orphaned { missing_parent } => {
+                                // Still missing parent, request it
+                                self.request_blocks(vec![missing_parent]);
+                            }
+                            BlockAddResult::Rejected(_) => {}
+                        }
+                    }
+
+                    // Check if we need to request next batch during sync
+                    if let SyncState::Syncing {
+                        target_height,
+                        current_batch_start: _,
+                    } = self.sync_state
+                    {
+                        let our_height = self.blockchain.main_chain_len() as u64;
+
+                        if our_height < target_height {
+                            // Request next batch
+                            let batch_end = (our_height + SYNC_BATCH_SIZE).min(target_height);
+                            info!(
+                                our_height = our_height,
+                                target_height = target_height,
+                                batch_end = batch_end,
+                                "Requesting next sync batch"
+                            );
+                            self.sync_state = SyncState::Syncing {
+                                target_height,
+                                current_batch_start: our_height,
+                            };
+                            self.request_block_range(our_height, batch_end);
+                        } else {
+                            // Sync complete
+                            info!("Blockchain sync complete");
+                            self.sync_state = SyncState::Synced;
                         }
                     }
                 }
@@ -408,9 +579,13 @@ impl Node {
             },
         );
 
-        // We don't track the request type here since the response will be blocks
-        self.pending_requests
-            .insert(request_id, SyncRequestType::Blocks(Vec::new()));
+        self.pending_requests.insert(
+            request_id,
+            SyncRequestType::BlockRange {
+                from: from_height,
+                to: to_height,
+            },
+        );
     }
 
     /// Helper: Get blocks by hash
@@ -458,21 +633,22 @@ impl Node {
         amount: u64,
     ) -> Result<Transaction, NodeError> {
         // 1. Check available balance accounting for pending transactions
-        let balance_info = self.get_balance_info();
-        if amount > balance_info.available {
+        let account_info = self.get_account_info();
+        let available = account_info.balance_info.available();
+        if amount > available {
             warn!(
                 amount = amount,
-                available = balance_info.available,
+                available = available,
                 "Insufficient balance to send transaction"
             );
-            return Err(NodeError::InsufficientBalance {
-                requested: amount,
-                available: balance_info.available,
-                pending: balance_info.pending_sends,
-            });
+            return Err(NodeError::InsufficientBalance(account_info.balance_info));
         }
+        let next_nonce = account_info.nonce_info.next_nonce();
+        debug!(next_nonce = next_nonce, "Using nonce for new transaction");
         // 2. Create the transaction
-        let tx = self.wallet.create_transaction(receiver_address, amount);
+        let tx = self
+            .wallet
+            .create_transaction(receiver_address, amount, next_nonce);
         // 3. Double-check against blockchain state (should always pass after step 1)
         // This catches race conditions or state inconsistencies
         debug_assert!(
@@ -545,8 +721,9 @@ impl Node {
         *self.wallet.address()
     }
 
-    pub fn get_balance_info(&self) -> BalanceInfo {
-        let confirmed = self.blockchain.get_balance(self.wallet.address());
+    pub fn get_account_info(&self) -> AccountInfo {
+        let account = self.blockchain.get_account_info(self.wallet.address());
+        let confirmed = account.balance();
 
         let pending_sends = self
             .mempool
@@ -561,29 +738,98 @@ impl Node {
                 }
             })
             .sum();
-        let available = confirmed.saturating_sub(pending_sends);
+        let balance_info = BalanceInfo::new(confirmed, pending_sends);
 
-        BalanceInfo {
-            confirmed,
-            pending_sends,
-            available,
+        let nonce = account.nonce();
+        let pending_nonces: Vec<u64> = self
+            .mempool
+            .pending_transactions()
+            .filter_map(|tx| {
+                if let Some(addr) = tx.sender()
+                    && addr == self.wallet.address()
+                {
+                    tx.nonce()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let nonce_info = NonceInfo::new(nonce, pending_nonces);
+        AccountInfo {
+            balance_info,
+            nonce_info,
         }
     }
 }
 
 #[derive(Debug)]
 pub struct BalanceInfo {
-    pub confirmed: u64,
-    pub pending_sends: u64,
-    pub available: u64,
+    confirmed: u64,
+    pending_sends: u64,
 }
 
-impl fmt::Display for BalanceInfo {
+impl BalanceInfo {
+    pub fn new(confirmed: u64, pending_sends: u64) -> Self {
+        debug_assert!(
+            confirmed >= pending_sends,
+            "Confirmed balance {confirmed} must be >= pending sends {pending_sends}"
+        );
+        Self {
+            confirmed,
+            pending_sends,
+        }
+    }
+
+    pub fn available(&self) -> u64 {
+        self.confirmed.saturating_sub(self.pending_sends)
+    }
+}
+#[derive(Debug)]
+pub struct NonceInfo {
+    current_nonce: u64,
+    pending_nonces: Vec<u64>,
+}
+impl NonceInfo {
+    pub fn new(current_nonce: u64, pending_nonces: Vec<u64>) -> Self {
+        debug_assert!(
+            pending_nonces.iter().all(|&n| n >= current_nonce),
+            "All pending nonces must be >= current nonce"
+        );
+        debug_assert!(
+            {
+                let mut sorted = pending_nonces.clone();
+                sorted.sort_unstable();
+                sorted.windows(2).all(|w| w[0] != w[1])
+            },
+            "Pending nonces must be unique and no-gaps"
+        );
+        Self {
+            current_nonce,
+            pending_nonces,
+        }
+    }
+
+    pub fn next_nonce(&self) -> u64 {
+        // Next nonce is current_nonce + number of pending transactions
+        // This works because pending_nonces are validated to be sequential with no gaps
+        self.current_nonce + self.pending_nonces.len() as u64
+    }
+}
+pub struct AccountInfo {
+    pub balance_info: BalanceInfo,
+    pub nonce_info: NonceInfo,
+}
+
+impl fmt::Display for AccountInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Confirmed: {}, Pending Sends: {}, Available: {}",
-            self.confirmed, self.pending_sends, self.available
+            "Confirmed Balance: {}, Pending Sends: {}, Available: {}, Current Nonce: {}, Next Nonce: {}",
+            self.balance_info.confirmed,
+            self.balance_info.pending_sends,
+            self.balance_info.available(),
+            self.nonce_info.current_nonce,
+            self.nonce_info.next_nonce()
         )
     }
 }
@@ -591,11 +837,7 @@ impl fmt::Display for BalanceInfo {
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error("Insufficient balance")]
-    InsufficientBalance {
-        requested: u64,
-        available: u64,
-        pending: u64,
-    },
+    InsufficientBalance(BalanceInfo),
     #[error("Transaction validation failed")]
     TransactionValidationFailed,
     #[error("Block rejected")]

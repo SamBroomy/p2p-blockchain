@@ -16,6 +16,7 @@ impl TransactionConstructor {
         sender: &Address,
         receiver: &Address,
         amount: u64,
+        nonce: u64,
         sender_private_key: &PrivateKey,
     ) -> Transaction {
         debug_assert!(amount > 0, "Transaction amount must be greater than 0");
@@ -24,7 +25,7 @@ impl TransactionConstructor {
             receiver.as_bytes(),
             "Sender and receiver must be different"
         );
-        let inner = InnerTransaction::new(*sender, *receiver, amount);
+        let inner = InnerTransaction::new(*sender, *receiver, amount, nonce);
         // 1. hash the transaction data
         let message_hash = inner.hash();
         // 2. sign the hash with sender's private key
@@ -49,8 +50,14 @@ impl TransactionConstructor {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum TransactionType {
-    Transfer { sender: Address, receiver: Address },
-    BlockReward { miner: Address },
+    Transfer {
+        sender: Address,
+        receiver: Address,
+        nonce: u64,
+    },
+    BlockReward {
+        miner: Address,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,9 +72,13 @@ impl InnerTransaction {
         utils::hash_inner_transaction(Hasher::new(), self)
     }
 
-    fn new(sender: Address, receiver: Address, amount: u64) -> Self {
+    fn new(sender: Address, receiver: Address, amount: u64, nonce: u64) -> Self {
         Self {
-            tx_type: TransactionType::Transfer { sender, receiver },
+            tx_type: TransactionType::Transfer {
+                sender,
+                receiver,
+                nonce,
+            },
             amount,
             timestamp: Utc::now(),
         }
@@ -160,27 +171,35 @@ impl Transaction {
     pub fn is_block_reward(&self) -> bool {
         matches!(self.inner.tx_type, TransactionType::BlockReward { .. })
     }
-}
 
-// Ignore block reward for now
-// enum TransactionType {
-//     Transfer,
-//     // BlockReward,
-// }
+    pub fn nonce(&self) -> Option<u64> {
+        match &self.inner.tx_type {
+            TransactionType::Transfer { nonce, .. } => Some(*nonce),
+            TransactionType::BlockReward { .. } => None,
+        }
+    }
+}
 
 mod utils {
     use super::{
         DateTime, Hash, Hasher, InnerTransaction, Signature, Transaction, TransactionType, Utc,
     };
-    use crate::consts::{BLOCK_REWARD_SIGNATURE_BYTES, MAX_FUTURE_TIMESTAMP_DRIFT, MAX_PAST_TIMESTAMP_DRIFT};
+    use crate::consts::{
+        BLOCK_REWARD_SIGNATURE_BYTES, MAX_FUTURE_TIMESTAMP_DRIFT, MAX_PAST_TIMESTAMP_DRIFT,
+    };
 
     #[inline]
     fn hash_transaction_type(hasher: &mut Hasher, tx_type: &TransactionType) {
         match tx_type {
-            TransactionType::Transfer { sender, receiver } => {
+            TransactionType::Transfer {
+                sender,
+                receiver,
+                nonce,
+            } => {
                 hasher.update(b"transfer"); // Type discriminator
                 hasher.update(sender.as_bytes());
                 hasher.update(receiver.as_bytes());
+                hasher.update(&nonce.to_le_bytes());
             }
             TransactionType::BlockReward { miner } => {
                 hasher.update(b"block_reward"); // Type discriminator
@@ -364,7 +383,8 @@ mod tests {
         let receiver_pk =
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
-        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, &sender_sk);
+        let tx =
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, 0, &sender_sk);
 
         assert_eq!(tx.sender(), Some(&sender_pk));
         assert_eq!(tx.receiver(), &receiver_pk);
@@ -382,7 +402,8 @@ mod tests {
         let receiver_pk =
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
-        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 50, &sender_sk);
+        let tx =
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 50, 0, &sender_sk);
 
         assert!(tx.is_validate());
     }
@@ -396,7 +417,8 @@ mod tests {
         let receiver_pk =
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
-        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 75, &sender_sk);
+        let tx =
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 75, 0, &sender_sk);
         let hash1 = tx.hash();
         let hash2 = tx.hash();
 
@@ -412,7 +434,8 @@ mod tests {
         let receiver_pk =
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
-        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 123, &sender_sk);
+        let tx =
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 123, 0, &sender_sk);
 
         let serialized = serde_json::to_string(&tx).expect("serialization failed");
         let deserialized: Transaction =
@@ -423,6 +446,49 @@ mod tests {
         assert_eq!(tx.amount(), deserialized.amount());
         assert_eq!(tx.hash(), deserialized.hash());
         assert!(deserialized.is_validate());
+    }
+
+    #[test]
+    fn test_transaction_nonce_included_in_hash() {
+        // Verify that changing the nonce changes the transaction hash
+        use crate::wallet::Wallet;
+        let sender = Wallet::new();
+        let receiver = Wallet::new();
+
+        let tx1 = sender.create_transaction(receiver.address(), 50, 0);
+        let tx2 = sender.create_transaction(receiver.address(), 50, 1);
+
+        // Same sender, receiver, amount, but different nonce = different hash
+        assert_ne!(
+            tx1.hash(),
+            tx2.hash(),
+            "Transactions with different nonces should have different hashes"
+        );
+    }
+
+    #[test]
+    fn test_transaction_replay_prevented_by_nonce() {
+        // Demonstrate that replay attacks are prevented by nonce
+        use crate::wallet::Wallet;
+        let sender = Wallet::new();
+        let receiver = Wallet::new();
+
+        // Create transaction with nonce 0
+        let tx1 = sender.create_transaction(receiver.address(), 50, 0);
+
+        // Create another transaction with different nonce
+        let tx2 = sender.create_transaction(receiver.address(), 50, 1);
+
+        // Different nonces = different transactions
+        assert_ne!(
+            tx1.hash(),
+            tx2.hash(),
+            "Transactions with different nonces should have different hashes"
+        );
+
+        // The key insight: same amount, sender, receiver but different nonce
+        // This prevents replay attacks where someone re-broadcasts the same transaction
+        // Each transaction must have a unique, sequential nonce from the sender
     }
 
     #[test]
@@ -477,7 +543,8 @@ mod tests {
         let receiver_pk =
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
-        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, &sender_sk);
+        let tx =
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, 0, &sender_sk);
 
         assert_eq!(tx.sender(), Some(&sender_pk), "Transfer should have sender");
         assert_eq!(tx.receiver(), &receiver_pk);
@@ -527,7 +594,8 @@ mod tests {
         let receiver_pk =
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
-        let tx = TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, &sender_sk);
+        let tx =
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, 0, &sender_sk);
 
         // Should pass validation (uses serde_valid under the hood)
         let serialized = serde_json::to_string(&tx).expect("serialization failed");
@@ -553,6 +621,7 @@ mod tests {
             tx_type: TransactionType::Transfer {
                 sender: sender_pk,
                 receiver: receiver_pk,
+                nonce: 0,
             },
             amount: 100,
             timestamp: far_future,

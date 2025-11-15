@@ -141,7 +141,7 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx = wallet1.create_transaction(wallet2.address(), 50);
+        let tx = wallet1.create_transaction(wallet2.address(), 50, 0);
 
         assert!(mempool.add_transaction(tx.clone()));
         assert_eq!(mempool.len(), 1);
@@ -157,8 +157,8 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx1 = wallet1.create_transaction(wallet2.address(), 50);
-        let tx2 = wallet1.create_transaction(wallet2.address(), 30);
+        let tx1 = wallet1.create_transaction(wallet2.address(), 50, 0);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 30, 0);
 
         mempool.add_transaction(tx1.clone());
         mempool.add_transaction(tx2.clone());
@@ -177,9 +177,9 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx1 = wallet1.create_transaction(wallet2.address(), 50);
-        let tx2 = wallet1.create_transaction(wallet2.address(), 30);
-        let tx3 = wallet1.create_transaction(wallet2.address(), 20);
+        let tx1 = wallet1.create_transaction(wallet2.address(), 50, 0);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 30, 0);
+        let tx3 = wallet1.create_transaction(wallet2.address(), 20, 0);
 
         mempool.add_transaction(tx1.clone());
         mempool.add_transaction(tx2.clone());
@@ -200,7 +200,7 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx = wallet1.create_transaction(wallet2.address(), 50);
+        let tx = wallet1.create_transaction(wallet2.address(), 50, 0);
 
         // First add succeeds
         assert!(mempool.add_transaction(tx.clone()));
@@ -218,7 +218,7 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx = wallet1.create_transaction(wallet2.address(), 50);
+        let tx = wallet1.create_transaction(wallet2.address(), 50, 0);
 
         // Add transaction
         assert!(mempool.add_transaction(tx.clone()));
@@ -243,8 +243,8 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx1 = wallet1.create_transaction(wallet2.address(), 50);
-        let tx2 = wallet1.create_transaction(wallet2.address(), 30);
+        let tx1 = wallet1.create_transaction(wallet2.address(), 50, 0);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 30, 0);
 
         // Add both transactions
         assert!(mempool.add_transaction(tx1.clone()));
@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(mempool.len(), 2);
 
         // Remove first transaction
-        mempool.remove_transactions(&[tx1.clone()]);
+        mempool.remove_transactions(std::slice::from_ref(&tx1));
         assert_eq!(mempool.len(), 1);
 
         // Should be able to re-add the removed transaction
@@ -270,7 +270,7 @@ mod tests {
         let wallet2 = Wallet::new();
 
         // Add a transaction
-        let tx = wallet1.create_transaction(wallet2.address(), 50);
+        let tx = wallet1.create_transaction(wallet2.address(), 50, 0);
         assert!(mempool.add_transaction(tx.clone()));
         assert_eq!(mempool.len(), 1);
 
@@ -290,7 +290,7 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx = wallet1.create_transaction(wallet2.address(), 50);
+        let tx = wallet1.create_transaction(wallet2.address(), 50, 0);
         assert!(mempool.add_transaction(tx));
 
         // Prune (won't remove anything as it's fresh)

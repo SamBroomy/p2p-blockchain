@@ -12,7 +12,7 @@ use rand::{RngCore, rngs::OsRng};
 use tracing::info;
 
 use crate::{
-    chain::{Chain, ForkChain, RootChain, is_connecting_block_valid},
+    chain::{Account, Chain, ForkChain, RootChain, is_connecting_block_valid},
     orphan_pool::OrphanPool,
 };
 
@@ -24,7 +24,7 @@ pub enum BlockAddResult {
     /// Block is an orphan (missing parent), added to orphan pool
     Orphaned { missing_parent: Hash },
     /// Block rejected (invalid or duplicate)
-    Rejected(Block),
+    Rejected(Box<Block>),
 }
 
 impl BlockAddResult {
@@ -48,7 +48,7 @@ impl BlockAddResult {
     /// **Note**: This treats `Orphaned` as `Ok(())` for compatibility with legacy Result-style code.
     /// If you need to distinguish between "fully processed" vs "buffered as orphan", use
     /// `is_success()` and `is_orphaned()` instead.
-    pub fn ok(self) -> Result<(), Block> {
+    pub fn ok(self) -> Result<(), Box<Block>> {
         match self {
             Self::Added { .. } | Self::Orphaned { .. } => Ok(()),
             Self::Rejected(block) => Err(block),
@@ -177,7 +177,7 @@ impl<M: MiningStrategy> BlockChain<M> {
                     }
                 } else {
                     // Block is invalid or parent exists (so rejection was due to transaction/balance issues)
-                    BlockAddResult::Rejected(rejected_block)
+                    BlockAddResult::Rejected(Box::new(rejected_block))
                 }
             }
         }
@@ -392,7 +392,7 @@ impl<M: MiningStrategy> BlockChain<M> {
 
     pub fn main_chain_len(&self) -> usize {
         debug_assert!(
-            self.main_chain.len() >= 1,
+            !self.main_chain.is_empty(),
             "Main chain must contain at least genesis block"
         );
         debug_assert!(
@@ -449,8 +449,19 @@ impl<M: MiningStrategy> BlockChain<M> {
         self.main_chain.cumulative_difficulty()
     }
 
-    pub fn get_balance(&self, address: &Address) -> u64 {
-        self.main_chain.get_balance(address)
+    pub fn get_account_info(&self, address: &Address) -> Account {
+        self.main_chain
+            .get_onchain_account(address)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn get_nonce(&self, address: &Address) -> u64 {
+        self.get_account_info(address).nonce()
+    }
+
+    fn get_balance(&self, address: &Address) -> u64 {
+        self.get_account_info(address).balance()
     }
 }
 
@@ -642,7 +653,7 @@ mod tests {
         let bob = Wallet::new();
 
         // Alice creates a transaction sending 50 to Bob
-        let tx = alice.create_transaction(bob.address(), 50);
+        let tx = alice.create_transaction(bob.address(), 50, 0);
 
         // Mine a block with this transaction
         let block1 = mine_block(1, genesis_hash, &[tx], 1);
@@ -675,7 +686,7 @@ mod tests {
         let bob = Wallet::new();
 
         // Alice tries to send more than she has (100)
-        let tx = alice.create_transaction(bob.address(), 150);
+        let tx = alice.create_transaction(bob.address(), 150, 0);
         let block1 = mine_block(1, genesis_hash, &[tx], 1);
 
         let result = blockchain.add_block(block1);
@@ -701,13 +712,13 @@ mod tests {
         let charlie = Wallet::new();
 
         // Main chain: Genesis -> Block1 (Alice -> Bob: 30)
-        let tx1 = alice.create_transaction(bob.address(), 30);
+        let tx1 = alice.create_transaction(bob.address(), 30, 0);
         let block1 = mine_block(1, genesis_hash, &[tx1], 1);
         let block1_hash = *block1.hash();
         let _ = blockchain.add_block(block1).ok();
 
         // Main chain continues: Block1 -> Block2 (Alice -> Charlie: 20)
-        let tx2 = alice.create_transaction(charlie.address(), 20);
+        let tx2 = alice.create_transaction(charlie.address(), 20, 1);
         let block2 = mine_block(2, block1_hash, &[tx2], 1);
         let _ = blockchain.add_block(block2).ok();
 
@@ -719,7 +730,8 @@ mod tests {
 
         // Create fork from Block1 with higher difficulty
         // Fork: Block1 -> Block3 (Alice -> Charlie: 40) -> Block4 (empty)
-        let tx3 = alice.create_transaction(charlie.address(), 40);
+        // Fork branches from block1, so alice's nonce on this fork is 1 (after tx1 in block1)
+        let tx3 = alice.create_transaction(charlie.address(), 40, 1);
         let block3 = mine_block(2, block1_hash, &[tx3], 3); // Higher difficulty
         let block3_hash = *block3.hash();
         let block4 = mine_block(3, block3_hash, &[], 3);
@@ -954,14 +966,15 @@ mod tests {
         let charlie = Wallet::new();
 
         // Main chain: Alice sends 80 to Bob
-        let tx_to_bob = alice.create_transaction(bob.address(), 80);
+        let tx_to_bob = alice.create_transaction(bob.address(), 80, 0);
         let block1 = mine_block(1, genesis_hash, &[tx_to_bob], 1);
         let _ = blockchain.add_block(block1).ok();
 
         let initial_main_len = blockchain.main_chain_len();
 
         // Fork from genesis: Alice sends 80 to Charlie (double-spend!)
-        let tx_to_charlie = alice.create_transaction(charlie.address(), 80);
+        // Fork starts from genesis, so nonce is also 0
+        let tx_to_charlie = alice.create_transaction(charlie.address(), 80, 0);
         let fork_block1 = mine_block(1, genesis_hash, &[tx_to_charlie], 3); // Higher difficulty
         let fork_block2_hash = *fork_block1.hash();
         let fork_block2 = mine_block(2, fork_block2_hash, &[], 3);
@@ -1095,18 +1108,19 @@ mod tests {
         let charlie = Wallet::new();
 
         // Main chain: Genesis -> A (Alice sends 30 to Bob)
-        let tx1 = alice.create_transaction(bob.address(), 30);
+        let tx1 = alice.create_transaction(bob.address(), 30, 0);
         let block_a = mine_block(1, genesis_hash, &[tx1], 1);
         let block_a_hash = *block_a.hash();
         let _ = blockchain.add_block(block_a).ok();
 
         // Main chain continues: A -> B (Alice sends 20 to Charlie)
-        let tx2 = alice.create_transaction(charlie.address(), 20);
+        let tx2 = alice.create_transaction(charlie.address(), 20, 1);
         let block_b = mine_block(2, block_a_hash, &[tx2], 1);
         let _ = blockchain.add_block(block_b).ok();
 
         // Fork from A: A -> C (Alice sends 40 to Charlie)
-        let tx3 = alice.create_transaction(charlie.address(), 40);
+        // Fork branches from block_a, so alice's nonce on this fork is 1 (after tx1 in block_a)
+        let tx3 = alice.create_transaction(charlie.address(), 40, 1);
         let block_c = mine_block(2, block_a_hash, &[tx3], 1);
         let block_c_hash = *block_c.hash();
         assert!(
@@ -1116,7 +1130,7 @@ mod tests {
 
         // Fork-of-fork from C: C -> D (Bob sends 10 to Charlie)
         let bob_wallet = Wallet::from_seed("bob");
-        let tx4 = bob_wallet.create_transaction(charlie.address(), 10);
+        let tx4 = bob_wallet.create_transaction(charlie.address(), 10, 0);
         let block_d = mine_block(3, block_c_hash, &[tx4], 1);
         assert!(
             blockchain.add_block(block_d).is_ok(),
@@ -1193,7 +1207,7 @@ mod tests {
         let charlie = Wallet::new();
 
         // Main chain: Genesis → A (Alice sends 20 to Bob)
-        let tx1 = alice.create_transaction(bob.address(), 20);
+        let tx1 = alice.create_transaction(bob.address(), 20, 0);
         let block_a = mine_block(1, genesis_hash, &[tx1], 1);
         let block_a_hash = *block_a.hash();
         let _ = blockchain.add_block(block_a).ok();
@@ -1201,7 +1215,7 @@ mod tests {
         assert_eq!(blockchain.main_chain_len(), 2, "Genesis + A");
 
         // Main chain continues: A → B (Alice sends 10 to Charlie)
-        let tx2 = alice.create_transaction(charlie.address(), 10);
+        let tx2 = alice.create_transaction(charlie.address(), 10, 1);
         let block_b = mine_block(2, block_a_hash, &[tx2], 1);
         let _ = blockchain.add_block(block_b).ok();
         assert_eq!(
@@ -1212,7 +1226,8 @@ mod tests {
         assert_eq!(blockchain.main_chain_len(), 3, "Genesis + A + B");
 
         // Fork1 from A: A → C (Alice sends 30 to Charlie)
-        let tx3 = alice.create_transaction(charlie.address(), 30);
+        // Fork branches from block_a, so alice's nonce on this fork is 1 (after tx1 in block_a)
+        let tx3 = alice.create_transaction(charlie.address(), 30, 1);
         let block_c = mine_block(2, block_a_hash, &[tx3], 1);
         let block_c_hash = *block_c.hash();
         let result_c = blockchain.add_block(block_c);
@@ -1232,7 +1247,7 @@ mod tests {
         // - Fork chain (Genesis + A + C + E): 2 + 2 + 2 + 2 = 8
         // Fork chain has higher difficulty, so reorganization will occur
         let bob_wallet = Wallet::from_seed("bob");
-        let tx4 = bob_wallet.create_transaction(charlie.address(), 5);
+        let tx4 = bob_wallet.create_transaction(charlie.address(), 5, 0);
         let block_e = mine_block(3, block_c_hash, &[tx4], 1);
         let result_e = blockchain.add_block(block_e);
         assert!(

@@ -31,9 +31,9 @@ impl OrphanPool {
     }
 
     /// Add an orphan block
-    pub fn add_orphan(&mut self, block: Block) -> Result<(), Block> {
+    pub fn add_orphan(&mut self, block: Block) -> Result<(), Box<Block>> {
         if self.count >= MAX_ORPHAN_BLOCKS {
-            return Err(block);
+            return Err(Box::new(block));
         }
 
         let parent_hash = *block.previous_hash();
@@ -67,7 +67,7 @@ impl OrphanPool {
             );
             self.count = self.count.saturating_sub(orphan_count);
 
-            // ⚡ Debug assertion to verify consistency
+            // verify consistency
             debug_assert_eq!(
                 self.count,
                 self.orphans_by_parent.values().map(Vec::len).sum::<usize>(),

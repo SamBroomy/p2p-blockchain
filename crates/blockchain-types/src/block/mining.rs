@@ -1575,7 +1575,7 @@ mod mining_tests {
     fn test_miner_with_transactions() {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
-        let tx = wallet1.create_transaction(wallet2.address(), 50);
+        let tx = wallet1.create_transaction(wallet2.address(), 50, 0);
 
         let constructor = create_constructor_with_txs(0, std::slice::from_ref(&tx), None);
         let block = Miner::mine(constructor, 1, None);
@@ -1589,8 +1589,8 @@ mod mining_tests {
     fn test_miner_const_with_transactions() {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
-        let tx1 = wallet1.create_transaction(wallet2.address(), 25);
-        let tx2 = wallet1.create_transaction(wallet2.address(), 15);
+        let tx1 = wallet1.create_transaction(wallet2.address(), 25, 0);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 15, 1);
 
         let constructor = create_constructor_with_txs(0, &[tx1.clone(), tx2.clone()], None);
         let block = ConstMiner::<2>::mine(constructor, 2, None);
@@ -1639,8 +1639,8 @@ mod mining_tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx1 = wallet1.create_transaction(wallet2.address(), 25);
-        let tx2 = wallet1.create_transaction(wallet2.address(), 15);
+        let tx1 = wallet1.create_transaction(wallet2.address(), 25, 0);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 15, 1);
 
         let constructor = create_constructor_with_txs(
             0,
@@ -1672,7 +1672,7 @@ mod mining_tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx = wallet1.create_transaction(wallet2.address(), 30);
+        let tx = wallet1.create_transaction(wallet2.address(), 30, 0);
 
         let constructor = create_constructor_with_txs(
             0,
@@ -1891,7 +1891,7 @@ mod mining_tests {
         let miner_wallet = Wallet::new();
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
-        let tx = wallet1.create_transaction(wallet2.address(), 25);
+        let tx = wallet1.create_transaction(wallet2.address(), 25, 0);
 
         let constructor = create_constructor_with_txs(0, &[tx], Some(*miner_wallet.address()));
         let block = ConstMiner::<2>::mine(constructor, 2, None);
@@ -1935,7 +1935,7 @@ mod mining_tests {
         let miner_wallet = Wallet::new();
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
-        let tx = wallet1.create_transaction(wallet2.address(), 30);
+        let tx = wallet1.create_transaction(wallet2.address(), 30, 0);
 
         let constructor = create_constructor_with_txs(
             0,
@@ -1995,8 +1995,8 @@ mod mining_tests {
         let wallet2 = Wallet::new();
 
         let mut transactions = Vec::new();
-        for _ in 0..(MAX_TRANSACTIONS_PER_BLOCK - 1) {
-            transactions.push(wallet1.create_transaction(wallet2.address(), 1));
+        for i in 0..(MAX_TRANSACTIONS_PER_BLOCK - 1) {
+            transactions.push(wallet1.create_transaction(wallet2.address(), 1, i as u64));
         }
 
         let constructor =
@@ -2020,8 +2020,8 @@ mod mining_tests {
         let wallet2 = Wallet::new();
 
         let mut transactions = Vec::new();
-        for _ in 0..(MAX_TRANSACTIONS_PER_BLOCK - 1) {
-            transactions.push(wallet1.create_transaction(wallet2.address(), 1));
+        for i in 0..(MAX_TRANSACTIONS_PER_BLOCK - 1) {
+            transactions.push(wallet1.create_transaction(wallet2.address(), 1, i as u64));
         }
 
         let constructor =

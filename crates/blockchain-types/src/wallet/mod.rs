@@ -43,7 +43,12 @@ impl Wallet {
         &self.public_key
     }
 
-    pub fn create_transaction(&self, receiver_address: &Address, amount: u64) -> Transaction {
+    pub fn create_transaction(
+        &self,
+        receiver_address: &Address,
+        amount: u64,
+        nonce: u64,
+    ) -> Transaction {
         debug_assert!(amount > 0, "Transaction amount must be > 0");
         debug_assert_ne!(
             self.public_key.as_bytes(),
@@ -55,6 +60,7 @@ impl Wallet {
             &self.public_key,
             receiver_address,
             amount,
+            nonce,
             &self.private_key,
         )
     }
@@ -100,11 +106,12 @@ mod tests {
         let sender = Wallet::new();
         let receiver = Wallet::new();
 
-        let tx = sender.create_transaction(receiver.address(), 100);
+        let tx = sender.create_transaction(receiver.address(), 100, 1);
 
         assert_eq!(tx.sender(), Some(sender.address()));
         assert_eq!(tx.receiver(), receiver.address());
         assert_eq!(tx.amount(), 100);
+        assert_eq!(tx.nonce(), Some(1));
         assert!(tx.is_validate());
     }
 }

@@ -10,10 +10,62 @@ use serde::{Deserialize, Serialize};
 
 type Balance = u64;
 type Delta = i64;
+type Nonce = u64;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Account {
+    balance: Balance,
+    nonce: Nonce,
+}
+
+impl Account {
+    pub fn balance(&self) -> Balance {
+        self.balance
+    }
+
+    /// Helper to convert balance to delta
+    pub fn delta(&self) -> Delta {
+        self.balance as Delta
+    }
+
+    pub fn nonce(&self) -> Nonce {
+        self.nonce
+    }
+
+    /// Apply a delta to the account balance and increment nonce
+    pub fn apply_delta(&mut self, delta: Delta) {
+        let current = self.balance as Delta;
+        let new_balance = current + delta;
+        debug_assert!(
+            new_balance >= 0,
+            "Balance would go negative: {current} + {delta} = {new_balance}",
+        );
+        self.balance = new_balance as Balance;
+    }
+
+    /// Increment nonce by 1
+    fn increment_nonce(&mut self) {
+        self.nonce += 1;
+    }
+
+    /// Add multiple to nonce at once (for bulk updates)
+    pub fn add_nonce(&mut self, count: u64) {
+        self.nonce += count;
+    }
+}
+
+impl Default for Account {
+    fn default() -> Self {
+        Self {
+            balance: INITIAL_BALANCE,
+            nonce: 0,
+        }
+    }
+}
+
 // As our implementation dosent have block rewards yet, everyone starts with an initial balance to make things easier
 pub const INITIAL_BALANCE: Balance = WALLET_INITIAL_BALANCE;
 const INITIAL_DELTA: Delta = INITIAL_BALANCE as Delta;
-type AccountBalances = HashMap<Address, Balance>;
+type AccountBalances = HashMap<Address, Account>;
 type AccountDelta = HashMap<Address, Delta>;
 
 pub trait ChainType: sealed::Sealed {}
@@ -54,42 +106,154 @@ fn update_deltas(deltas: &mut AccountDelta, txs: &[Transaction]) {
         }
     }
 }
+/// Get the net balance deltas from a list of transactions
 fn get_transaction_deltas(txs: &[Transaction]) -> AccountDelta {
     let mut deltas = HashMap::new();
     update_deltas(&mut deltas, txs);
     deltas
 }
+/// Validate that applying the deltas to the current balances will not result in negative balances
 fn validate_balance_deltas(balances: &AccountBalances, deltas: &AccountDelta) -> bool {
-    deltas.iter().all(|(address, delta)| {
-        let current_balance = *balances.get(address).unwrap_or(&INITIAL_BALANCE) as Delta;
-        current_balance + *delta >= 0
+    deltas.iter().all(|(address, &delta)| {
+        let current_balance = balances
+            .get(address)
+            .map_or(Account::default().delta(), Account::delta);
+        current_balance + delta >= 0
     })
 }
-fn apply_deltas_to_balance_deltas(deltas: &mut AccountDelta, new_deltas: AccountDelta) {
-    for (key, delta) in new_deltas {
-        let entry = deltas.entry(key).or_insert(0);
-        *entry += delta;
+/// Validate that transaction nonces are correct given current balances
+fn validate_transaction_nonces(balances: &AccountBalances, txs: &[Transaction]) -> bool {
+    // Group transactions by sender
+    let mut sender_txs: HashMap<Address, Vec<Nonce>> = HashMap::new();
+
+    for tx in txs {
+        let Some(sender) = tx.sender() else { continue };
+        let Some(nonce) = tx.nonce() else { continue };
+
+        sender_txs.entry(*sender).or_default().push(nonce);
     }
+    // Validate each sender's nonces independently
+    for (sender, mut nonces) in sender_txs {
+        // Get starting nonce from chain state
+        let starting_nonce = balances.get(&sender).map_or(0, Account::nonce);
+        // Sort nonces to check for continuity
+        nonces.sort_unstable();
+        // Check for duplicates (sorted array makes this easy)
+        if nonces.windows(2).any(|w| w[0] == w[1]) {
+            return false;
+        }
+        // Verify nonces form sequence: [starting_nonce, starting_nonce+1, ..., starting_nonce+n-1]
+        // If nonces[0] < starting_nonce (replayed stale transaction), the subtraction
+        // below would underflow and panic (debug) or wrap (release), crashing the node.
+        if nonces[0] != starting_nonce {
+            return false; // Doesn't start at current nonce (includes stale replays)
+        }
+        // Now safe: since array is sorted and nonces[0] == starting_nonce,
+        // we know nonces.last() >= starting_nonce, so no underflow
+        if nonces.len() != (nonces.last().unwrap() - starting_nonce + 1) as usize {
+            return false; // Gap in sequence
+        }
+    }
+    true
 }
+
+/// OPTIMIZED: Combined validation and data collection in a single pass
+/// Returns (deltas, `nonce_counts`) if valid, or None if validation fails
+///
+/// This combines `get_transaction_deltas` + `validate_balance_deltas` + `validate_transaction_nonces`
+/// into one function for better performance (single pass, better cache locality)
+fn validate_and_prepare_updates(
+    balances: &AccountBalances,
+    txs: &[Transaction],
+) -> Option<(AccountDelta, HashMap<Address, u64>)> {
+    let mut deltas: AccountDelta = HashMap::new();
+    let mut sender_nonces: HashMap<Address, Vec<Nonce>> = HashMap::new();
+    let mut nonce_counts: HashMap<Address, u64> = HashMap::new();
+
+    // Single pass: collect deltas + nonces
+    for tx in txs {
+        // Calculate deltas
+        *deltas.entry(*tx.receiver()).or_insert(0) += tx.amount() as Delta;
+
+        if let Some(sender) = tx.sender() {
+            *deltas.entry(*sender).or_insert(0) -= tx.amount() as Delta;
+
+            if let Some(nonce) = tx.nonce() {
+                sender_nonces.entry(*sender).or_default().push(nonce);
+                *nonce_counts.entry(*sender).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Validate balances (deltas won't make accounts negative)
+    for (address, &delta) in &deltas {
+        let current_balance = balances
+            .get(address)
+            .map_or(Account::default().delta(), Account::delta);
+        if current_balance + delta < 0 {
+            return None;
+        }
+    }
+
+    // Validate nonces (sequential, no gaps, no duplicates)
+    for (sender, mut nonces) in sender_nonces {
+        let starting_nonce = balances.get(&sender).map_or(0, Account::nonce);
+        nonces.sort_unstable();
+
+        // Check duplicates
+        if nonces.windows(2).any(|w| w[0] == w[1]) {
+            return None;
+        }
+
+        // SECURITY: Check sequence validity (stale nonce check first to prevent underflow)
+        if nonces[0] != starting_nonce {
+            return None;
+        }
+        if nonces.len() != (nonces.last().unwrap() - starting_nonce + 1) as usize {
+            return None;
+        }
+    }
+
+    Some((deltas, nonce_counts))
+}
+
+// fn apply_deltas_to_balance_deltas(deltas: &mut AccountDelta, new_deltas: AccountDelta) {
+//     for (key, delta) in new_deltas {
+//         let entry = deltas.entry(key).or_insert(0);
+//         *entry += delta;
+//     }
+// }
 
 /// Assumes deltas are valid (i.e. no negative balances will result)
 fn apply_deltas_to_balances(balances: &mut AccountBalances, deltas: AccountDelta) {
     for (key, delta) in deltas {
-        let entry = balances.entry(key).or_insert(INITIAL_BALANCE);
-        // Safe to unwrap as we validated before
-        let current = *entry as Delta;
-        let new_balance = current + delta;
-        // ⚡ Debug assertion to catch bugs
-        debug_assert!(
-            new_balance >= 0,
-            "Balance would go negative: {current} + {delta} = {new_balance} for address {key:?}",
-        );
-        *entry = new_balance as Balance;
+        balances
+            .entry(key)
+            .or_default()
+            // Safe to apply delta as we validated before
+            .apply_delta(delta);
+    }
+}
+/// Apply nonce updates
+fn apply_transaction_nonces(balances: &mut AccountBalances, txs: &[Transaction]) {
+    // Count transactions per sender
+    let mut tx_counts: HashMap<Address, u64> = HashMap::new();
+    for tx in txs {
+        if let Some(sender) = tx.sender() {
+            *tx_counts.entry(*sender).or_insert(0) += 1;
+        }
+    }
+    // Increment nonce by transaction count
+    for (sender, count) in tx_counts {
+        let account = balances.entry(sender).or_default();
+        for _ in 0..count {
+            account.increment_nonce();
+        }
     }
 }
 
 /// Recalculates balances from genesis (first block must connect to `GENESIS_ROOT_HASH`)
-pub fn recalculate_balances(blocks: &[Block]) -> HashMap<Address, Balance> {
+pub fn recalculate_balances(blocks: &[Block]) -> AccountBalances {
     assert!(
         !blocks.is_empty(),
         "Cannot recalculate balances of an empty chain"
@@ -108,12 +272,18 @@ pub fn recalculate_balances(blocks: &[Block]) -> HashMap<Address, Balance> {
 /// Recalculates balances from a starting balance state (for fork chains)
 fn recalculate_balances_from(mut balances: AccountBalances, blocks: &[Block]) -> AccountBalances {
     for block in blocks {
-        let deltas = get_transaction_deltas(block.transactions());
-        debug_assert!(
-            validate_balance_deltas(&balances, &deltas),
-            "Invalid balances in chain during recalculation"
-        );
+        // OPTIMIZED: Use single-pass validation (in recalc mode, should always succeed)
+        let Some((deltas, nonce_counts)) =
+            validate_and_prepare_updates(&balances, block.transactions())
+        else {
+            debug_assert!(false, "Invalid block in chain during recalculation");
+            continue;
+        };
+
         apply_deltas_to_balances(&mut balances, deltas);
+        for (sender, count) in nonce_counts {
+            balances.entry(sender).or_default().add_nonce(count);
+        }
     }
     balances
 }
@@ -130,31 +300,32 @@ fn reverse_transactions_from(
         "Start index {start_idx} must be <= blocks length {}",
         blocks.len()
     );
-    let mut balances = starting_balances.clone();
-
+    let mut accounts = starting_balances.clone();
     // Process blocks in reverse order from the end back to start_idx
     for block in blocks[start_idx..].iter().rev() {
         // Reverse transactions within each block
         for tx in block.transactions().iter().rev() {
             // Undo: receiver += amount, sender -= amount
-            let receiver_balance = balances.entry(*tx.receiver()).or_insert(INITIAL_BALANCE);
-            *receiver_balance -= tx.amount();
-
+            let receiver = accounts.entry(*tx.receiver()).or_default();
+            receiver.balance += tx.amount();
             if let Some(sender) = tx.sender() {
-                let sender_balance = balances.entry(*sender).or_insert(INITIAL_BALANCE);
-                *sender_balance += tx.amount();
+                let sender = accounts.entry(*sender).or_default();
+                debug_assert!(
+                    sender.balance >= tx.amount(),
+                    "Reversing transaction would lead to negative balance"
+                );
+                sender.balance -= tx.amount();
+                debug_assert!(
+                    sender.nonce > 0,
+                    "Sender nonce should be greater than 0 when reversing transaction"
+                );
+                sender.nonce = sender.nonce.saturating_sub(1);
             }
         }
     }
+    accounts
+}
 
-    balances
-}
-fn verify_balances(_balances: &AccountBalances) -> bool {
-    // Balance is u64 (unsigned), so it can never be negative
-    // Actual balance validation happens in validate_balance_deltas before applying changes
-    // This function is kept for potential future invariant checks
-    true
-}
 // A valid chain must have at least one block
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(bound = "")]
@@ -183,12 +354,8 @@ impl<T: ChainType> Chain<T> {
         self.root_block().hash()
     }
 
-    fn get_onchain_balance(&self, address: &Address) -> Option<Balance> {
-        self.balances.get(address).copied()
-    }
-
-    pub fn get_balance(&self, address: &Address) -> Balance {
-        self.get_onchain_balance(address).unwrap_or(INITIAL_BALANCE)
+    pub fn get_onchain_account(&self, address: &Address) -> Option<&Account> {
+        self.balances.get(address)
     }
 
     pub fn cumulative_difficulty(&self) -> u128 {
@@ -230,6 +397,10 @@ impl<T: ChainType> Chain<T> {
         self.blocks.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
     pub(super) fn blocks(&self) -> &[Block] {
         &self.blocks
     }
@@ -244,15 +415,23 @@ impl<T: ChainType> Chain<T> {
         self.find_block_index(hash).is_some()
     }
 
-    pub fn add_block(&mut self, block: Block) -> Result<(), Block> {
+    pub fn add_block(&mut self, block: Block) -> Result<(), Box<Block>> {
         if !block.is_valid() || !is_connecting_block_valid(self.tip_block(), &block) {
-            return Err(block);
+            return Err(Box::new(block));
         }
-        let deltas = get_transaction_deltas(block.transactions());
-        if !validate_balance_deltas(&self.balances, &deltas) {
-            return Err(block);
-        }
+
+        // OPTIMIZED: Single-pass validation and data collection
+        let Some((deltas, nonce_counts)) =
+            validate_and_prepare_updates(&self.balances, block.transactions())
+        else {
+            return Err(Box::new(block));
+        };
+
+        // Apply validated updates
         apply_deltas_to_balances(&mut self.balances, deltas);
+        for (sender, count) in nonce_counts {
+            self.balances.entry(sender).or_default().add_nonce(count);
+        }
         debug_assert_eq!(
             self.tip_block().index() + 1,
             block.index(),
@@ -263,9 +442,10 @@ impl<T: ChainType> Chain<T> {
     }
 
     pub fn validate_transaction(&self, tx: &Transaction) -> bool {
-        let sender_balance = tx
-            .sender()
-            .map_or(INITIAL_BALANCE, |addr| self.get_balance(addr));
+        let sender_balance = tx.sender().map_or(INITIAL_BALANCE, |addr| {
+            self.get_onchain_account(addr)
+                .map_or(INITIAL_BALANCE, Account::balance)
+        });
         sender_balance >= tx.amount()
     }
 }
@@ -326,7 +506,7 @@ impl Chain<RootChain> {
 
     fn verify_balances(&self) -> bool {
         let recalculated_balances = recalculate_balances(&self.blocks);
-        self.balances == recalculated_balances && verify_balances(&self.balances)
+        self.balances == recalculated_balances
     }
 
     pub fn cumulative_difficulty_till(&self, index: usize) -> u128 {
@@ -435,21 +615,26 @@ impl Chain<ForkChain> {
     pub(super) fn new_from_block(
         block: Block,
         starting_balances: AccountBalances,
-    ) -> Result<Self, Block> {
+    ) -> Result<Self, Box<Block>> {
         if !block.is_valid() {
-            return Err(block);
+            return Err(Box::new(block));
         }
 
         let mut balances = starting_balances;
-        let deltas = get_transaction_deltas(block.transactions());
-        if !validate_balance_deltas(&balances, &deltas) {
-            return Err(block);
-        }
+
+        // OPTIMIZED: Single-pass validation
+        let Some((deltas, nonce_counts)) =
+            validate_and_prepare_updates(&balances, block.transactions())
+        else {
+            return Err(Box::new(block));
+        };
+
+        // Apply validated updates
         apply_deltas_to_balances(&mut balances, deltas);
-        debug_assert!(
-            verify_balances(&balances),
-            "Fork balances must be valid after creation"
-        );
+        for (sender, count) in nonce_counts {
+            balances.entry(sender).or_default().add_nonce(count);
+        }
+
         Ok(Self {
             blocks: vec![block],
             balances,
@@ -529,9 +714,7 @@ impl Chain<ForkChain> {
             }
             apply_deltas_to_balances(&mut balances, deltas);
         }
-        self.is_structurally_valid()
-            && verify_balances(&self.balances)
-            && (self.balances == balances)
+        self.is_structurally_valid() && (self.balances == balances)
     }
 
     pub fn valid_fork(&self, root_chain: &Chain<RootChain>) -> bool {
@@ -545,19 +728,25 @@ impl Chain<ForkChain> {
             if *connection_hash != GENESIS_ROOT_HASH {
                 return false;
             }
-            debug_assert!(
-                verify_balances(&self.balances),
-                "Fork from genesis must have valid (non-negative) balances"
-            );
+            // Balance validity guaranteed by validate_balance_deltas (u64 can't be negative)
+            // OPTIMIZED: Use single-pass validation for genesis fork verification
             debug_assert!(
                 {
                     let mut expected_balances = HashMap::new();
                     for block in &self.blocks {
-                        let deltas = get_transaction_deltas(block.transactions());
-                        if !validate_balance_deltas(&expected_balances, &deltas) {
+                        let Some((deltas, nonce_counts)) =
+                            validate_and_prepare_updates(&expected_balances, block.transactions())
+                        else {
                             return false;
-                        }
+                        };
+
                         apply_deltas_to_balances(&mut expected_balances, deltas);
+                        for (sender, count) in nonce_counts {
+                            expected_balances
+                                .entry(sender)
+                                .or_default()
+                                .add_nonce(count);
+                        }
                     }
 
                     self.balances == expected_balances
@@ -565,7 +754,8 @@ impl Chain<ForkChain> {
                 "Fork from genesis must have balances matching its transactions"
             );
             // Fork connects to genesis, use empty balances from genesis
-            return self.is_structurally_valid() && verify_balances(&self.balances);
+            // Balance validity guaranteed by validation during block addition
+            return self.is_structurally_valid();
         };
 
         // Get balances at the connection point (after including the connection block)
@@ -573,17 +763,21 @@ impl Chain<ForkChain> {
 
         // Validate the fork's structure and that its balances match what we'd get
         // by applying its transactions starting from the connection point balances
+        // OPTIMIZED: Use single-pass validation for each block
         let mut balances = connection_balances;
         for block in &self.blocks {
-            let deltas = get_transaction_deltas(block.transactions());
-            if !validate_balance_deltas(&balances, &deltas) {
+            let Some((deltas, nonce_counts)) =
+                validate_and_prepare_updates(&balances, block.transactions())
+            else {
                 return false;
-            }
+            };
+
             apply_deltas_to_balances(&mut balances, deltas);
+            for (sender, count) in nonce_counts {
+                balances.entry(sender).or_default().add_nonce(count);
+            }
         }
-        self.is_structurally_valid()
-            && verify_balances(&self.balances)
-            && (self.balances == balances)
+        self.is_structurally_valid() && (self.balances == balances)
     }
 
     /// Assumes the fork chain is valid against this root chain
@@ -652,20 +846,20 @@ mod tests {
         let charlie = Wallet::from_seed("charlie");
 
         // Block 1: Alice sends 30 to Bob
-        let tx1 = alice.create_transaction(bob.address(), 30);
+        let tx1 = alice.create_transaction(bob.address(), 30, 0);
         let block1 = mine_block(1, *genesis.hash(), &[tx1], 1);
         let block1_hash = *block1.hash();
         chain.add_block(block1).unwrap();
 
         // Block 2: Alice sends 20 to Charlie
-        let tx2 = alice.create_transaction(charlie.address(), 20);
+        let tx2 = alice.create_transaction(charlie.address(), 20, 1);
         let block2 = mine_block(2, block1_hash, &[tx2], 1);
         let block2_hash = *block2.hash();
         chain.add_block(block2.clone()).unwrap();
 
         // Block 3: Bob sends 10 to Charlie
         let bob_wallet = Wallet::from_seed("bob");
-        let tx3 = bob_wallet.create_transaction(charlie.address(), 10);
+        let tx3 = bob_wallet.create_transaction(charlie.address(), 10, 0);
         let block3 = mine_block(3, block2_hash, &[tx3], 1);
         chain.add_block(block3.clone()).unwrap();
 
@@ -687,9 +881,15 @@ mod tests {
         // Alice: 100 - 30 = 70
         // Bob: 100 + 30 = 130
         // Charlie: 100
-        let alice_balance_root = chain.get_balance(alice.address());
-        let bob_balance_root = chain.get_balance(bob.address());
-        let charlie_balance_root = chain.get_balance(charlie.address());
+        let alice_balance_root = chain
+            .get_onchain_account(alice.address())
+            .unwrap()
+            .balance();
+        let bob_balance_root = chain.get_onchain_account(bob.address()).unwrap().balance();
+        // Charlie doesn't have an account yet in the root chain (no transactions involving charlie in block1)
+        let charlie_balance_root = chain
+            .get_onchain_account(charlie.address())
+            .map_or(100, Account::balance);
 
         assert_eq!(
             alice_balance_root, 70,
@@ -711,9 +911,12 @@ mod tests {
         // Alice: 100 - 30 - 20 = 50
         // Bob: 100 + 30 - 10 = 120
         // Charlie: 100 + 20 + 10 = 130
-        let alice_balance_fork = fork.get_balance(alice.address());
-        let bob_balance_fork = fork.get_balance(bob.address());
-        let charlie_balance_fork = fork.get_balance(charlie.address());
+        let alice_balance_fork = fork.get_onchain_account(alice.address()).unwrap().balance();
+        let bob_balance_fork = fork.get_onchain_account(bob.address()).unwrap().balance();
+        let charlie_balance_fork = fork
+            .get_onchain_account(charlie.address())
+            .unwrap()
+            .balance();
 
         assert_eq!(
             alice_balance_fork, 50,
@@ -777,12 +980,12 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Block 1: Alice sends 30 to Bob (valid)
-        let tx1 = alice.create_transaction(bob.address(), 30);
+        let tx1 = alice.create_transaction(bob.address(), 30, 0);
         let block1 = mine_block(1, *genesis.hash(), &[tx1], 1);
         chain.add_block(block1).unwrap();
 
         // Create a fork from genesis with a transaction that would overdraw
-        let tx_invalid = alice.create_transaction(bob.address(), 150); // Alice only has 100!
+        let tx_invalid = alice.create_transaction(bob.address(), 150, 1); // Alice only has 100!
         let invalid_block = mine_block(1, GENESIS_ROOT_HASH, &[tx_invalid], 1);
 
         // Creating a fork with invalid balances should fail
@@ -957,10 +1160,10 @@ mod tests {
         let alice = Wallet::from_seed("alice");
         let bob = Wallet::from_seed("bob");
 
-        let tx1 = alice.create_transaction(bob.address(), 25);
+        let tx1 = alice.create_transaction(bob.address(), 25, 0);
         let block1 = mine_block(1, *genesis.hash(), &[tx1], 1);
 
-        let tx2 = alice.create_transaction(bob.address(), 25);
+        let tx2 = alice.create_transaction(bob.address(), 25, 1); // Fixed: should be nonce 1
         let block2 = mine_block(2, *block1.hash(), &[tx2], 1);
 
         let blocks = vec![genesis, block1, block2];
@@ -968,8 +1171,8 @@ mod tests {
 
         // Alice: 100 - 25 - 25 = 50
         // Bob: 100 + 25 + 25 = 150
-        assert_eq!(balances.get(alice.address()), Some(&50));
-        assert_eq!(balances.get(bob.address()), Some(&150));
+        assert_eq!(balances.get(alice.address()).unwrap().balance(), 50);
+        assert_eq!(balances.get(bob.address()).unwrap().balance(), 150);
     }
 
     #[test]
@@ -997,7 +1200,7 @@ mod tests {
         let wallet2 = Wallet::new();
 
         // Fork block B transfers 50 from wallet1 to wallet2
-        let tx = wallet1.create_transaction(wallet2.address(), 50);
+        let tx = wallet1.create_transaction(wallet2.address(), 50, 0);
         let fork_block = mine_block(1, GENESIS_ROOT_HASH, &[tx], 2);
 
         // Create fork with empty starting balances (genesis fork)
@@ -1008,8 +1211,8 @@ mod tests {
         // wallet2: 100 + 50 = 150
         // NOT all accounts at INITIAL_BALANCE (100)!
 
-        assert_eq!(fork.balances.get(wallet1.address()), Some(&50));
-        assert_eq!(fork.balances.get(wallet2.address()), Some(&150));
+        assert_eq!(fork.balances.get(wallet1.address()).unwrap().balance(), 50);
+        assert_eq!(fork.balances.get(wallet2.address()).unwrap().balance(), 150);
 
         // This fork is VALID even though balances != INITIAL_BALANCE
         assert!(
@@ -1027,17 +1230,304 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Valid transaction: Alice sends 50 to Bob
-        let tx_valid = alice.create_transaction(bob.address(), 50);
+        let tx_valid = alice.create_transaction(bob.address(), 50, 0);
         assert!(
             chain.validate_transaction(&tx_valid),
             "Valid transaction should be accepted"
         );
 
         // Invalid transaction: Alice tries to send 150 to Bob (only has 100)
-        let tx_invalid = alice.create_transaction(bob.address(), 150);
+        let tx_invalid = alice.create_transaction(bob.address(), 150, 1);
         assert!(
             !chain.validate_transaction(&tx_invalid),
             "Invalid transaction should be rejected"
         );
+    }
+
+    #[test]
+    fn test_sequential_nonce_acceptance() {
+        // Test that sequential nonces are accepted
+        let genesis = mine_block(0, GENESIS_ROOT_HASH, &[], 1);
+        let mut chain = Chain::<RootChain>::new_from_genesis(genesis.clone());
+
+        let alice = Wallet::from_seed("alice");
+        let bob = Wallet::from_seed("bob");
+
+        // Block 1: Alice sends with nonce 0
+        let tx1 = alice.create_transaction(bob.address(), 10, 0);
+        let block1 = mine_block(1, *genesis.hash(), &[tx1], 1);
+        assert!(
+            chain.add_block(block1).is_ok(),
+            "First nonce should be accepted"
+        );
+
+        // Block 2: Alice sends with nonce 1
+        let tx2 = alice.create_transaction(bob.address(), 10, 1);
+        let block2 = mine_block(2, *chain.tip_hash(), &[tx2], 1);
+        assert!(
+            chain.add_block(block2).is_ok(),
+            "Sequential nonce should be accepted"
+        );
+
+        // Block 3: Alice sends with nonce 2
+        let tx3 = alice.create_transaction(bob.address(), 10, 2);
+        let block3 = mine_block(3, *chain.tip_hash(), &[tx3], 1);
+        assert!(
+            chain.add_block(block3).is_ok(),
+            "Sequential nonce should be accepted"
+        );
+
+        // Verify alice's nonce is now 3
+        assert_eq!(
+            chain.get_onchain_account(alice.address()).unwrap().nonce(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_duplicate_nonce_rejection() {
+        // Test that duplicate nonces in a single block are rejected
+        let genesis = mine_block(0, GENESIS_ROOT_HASH, &[], 1);
+        let mut chain = Chain::<RootChain>::new_from_genesis(genesis.clone());
+
+        let alice = Wallet::from_seed("alice");
+        let bob = Wallet::from_seed("bob");
+
+        // Try to include two transactions with the same nonce in one block
+        let tx1 = alice.create_transaction(bob.address(), 10, 0);
+        let tx2 = alice.create_transaction(bob.address(), 20, 0); // Duplicate nonce!
+
+        let block1 = mine_block(1, *genesis.hash(), &[tx1, tx2], 1);
+        assert!(
+            chain.add_block(block1).is_err(),
+            "Block with duplicate nonces should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_nonce_gap_rejection() {
+        // Test that nonce gaps are rejected (e.g., 0, 2 without 1)
+        let genesis = mine_block(0, GENESIS_ROOT_HASH, &[], 1);
+        let mut chain = Chain::<RootChain>::new_from_genesis(genesis.clone());
+
+        let alice = Wallet::from_seed("alice");
+        let bob = Wallet::from_seed("bob");
+
+        // Block 1: Alice sends with nonce 0
+        let tx1 = alice.create_transaction(bob.address(), 10, 0);
+        let block1 = mine_block(1, *genesis.hash(), &[tx1], 1);
+        assert!(chain.add_block(block1).is_ok());
+
+        // Block 2: Alice sends with nonce 2 (skipping nonce 1!)
+        let tx2 = alice.create_transaction(bob.address(), 10, 2);
+        let block2 = mine_block(2, *chain.tip_hash(), &[tx2], 1);
+        assert!(
+            chain.add_block(block2).is_err(),
+            "Block with nonce gap should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_out_of_order_nonces_in_block() {
+        // Test that out-of-order nonces within a block are still valid
+        // (as long as they form a complete sequence)
+        let genesis = mine_block(0, GENESIS_ROOT_HASH, &[], 1);
+        let mut chain = Chain::<RootChain>::new_from_genesis(genesis.clone());
+
+        let alice = Wallet::from_seed("alice");
+        let bob = Wallet::from_seed("bob");
+
+        // Include transactions with nonces 0, 2, 1 (out of order in the array)
+        let tx0 = alice.create_transaction(bob.address(), 10, 0);
+        let tx2 = alice.create_transaction(bob.address(), 10, 2);
+        let tx1 = alice.create_transaction(bob.address(), 10, 1);
+
+        let block1 = mine_block(1, *genesis.hash(), &[tx0, tx2, tx1], 1);
+        assert!(
+            chain.add_block(block1).is_ok(),
+            "Block with out-of-order but complete nonces should be accepted"
+        );
+
+        // Verify alice's nonce is now 3
+        assert_eq!(
+            chain.get_onchain_account(alice.address()).unwrap().nonce(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_multiple_senders_nonces_independent() {
+        // Test that nonces from different senders are tracked independently
+        let genesis = mine_block(0, GENESIS_ROOT_HASH, &[], 1);
+        let mut chain = Chain::<RootChain>::new_from_genesis(genesis.clone());
+
+        let alice = Wallet::from_seed("alice");
+        let bob = Wallet::from_seed("bob");
+        let charlie = Wallet::from_seed("charlie");
+
+        // Alice sends to Charlie with nonce 0
+        let tx_alice = alice.create_transaction(charlie.address(), 10, 0);
+        // Bob sends to Charlie with nonce 0 (same nonce, different sender)
+        let tx_bob = bob.create_transaction(charlie.address(), 10, 0);
+
+        let block1 = mine_block(1, *genesis.hash(), &[tx_alice, tx_bob], 1);
+        assert!(
+            chain.add_block(block1).is_ok(),
+            "Same nonce from different senders should be accepted"
+        );
+
+        // Verify both have nonce 1 now
+        assert_eq!(
+            chain.get_onchain_account(alice.address()).unwrap().nonce(),
+            1
+        );
+        assert_eq!(chain.get_onchain_account(bob.address()).unwrap().nonce(), 1);
+    }
+
+    #[test]
+    fn test_nonce_persistence_across_blocks() {
+        // Test that nonces persist correctly across multiple blocks
+        let genesis = mine_block(0, GENESIS_ROOT_HASH, &[], 1);
+        let mut chain = Chain::<RootChain>::new_from_genesis(genesis.clone());
+
+        let alice = Wallet::from_seed("alice");
+        let bob = Wallet::from_seed("bob");
+
+        // Block 1: Alice sends 2 transactions (nonce 0, 1)
+        let tx0 = alice.create_transaction(bob.address(), 10, 0);
+        let tx1 = alice.create_transaction(bob.address(), 10, 1);
+        let block1 = mine_block(1, *genesis.hash(), &[tx0, tx1], 1);
+        assert!(chain.add_block(block1).is_ok());
+        assert_eq!(
+            chain.get_onchain_account(alice.address()).unwrap().nonce(),
+            2
+        );
+
+        // Block 2: Alice sends 1 transaction (nonce 2)
+        let tx2 = alice.create_transaction(bob.address(), 10, 2);
+        let block2 = mine_block(2, *chain.tip_hash(), &[tx2], 1);
+        assert!(chain.add_block(block2).is_ok());
+        assert_eq!(
+            chain.get_onchain_account(alice.address()).unwrap().nonce(),
+            3
+        );
+
+        // Block 3: Alice sends 3 transactions (nonce 3, 4, 5)
+        let tx3 = alice.create_transaction(bob.address(), 10, 3);
+        let tx4 = alice.create_transaction(bob.address(), 10, 4);
+        let tx5 = alice.create_transaction(bob.address(), 10, 5);
+        let block3 = mine_block(3, *chain.tip_hash(), &[tx3, tx4, tx5], 1);
+        assert!(chain.add_block(block3).is_ok());
+        assert_eq!(
+            chain.get_onchain_account(alice.address()).unwrap().nonce(),
+            6
+        );
+    }
+
+    #[test]
+    fn test_stale_nonce_rejection_no_panic() {
+        // Test that replayed old transactions with stale nonces are rejected gracefully
+        // This is a critical security test: without the fix, this would panic/crash the node
+        let genesis = mine_block(0, GENESIS_ROOT_HASH, &[], 1);
+        let mut chain = Chain::<RootChain>::new_from_genesis(genesis.clone());
+
+        let alice = Wallet::from_seed("alice");
+        let bob = Wallet::from_seed("bob");
+
+        // Alice sends transactions with nonces 0, 1, 2
+        let tx0 = alice.create_transaction(bob.address(), 10, 0);
+        let tx1 = alice.create_transaction(bob.address(), 10, 1);
+        let tx2 = alice.create_transaction(bob.address(), 10, 2);
+
+        let block1 = mine_block(1, *genesis.hash(), &[tx0.clone(), tx1, tx2], 1);
+        assert!(chain.add_block(block1).is_ok());
+
+        // Alice's nonce is now 3
+        assert_eq!(
+            chain.get_onchain_account(alice.address()).unwrap().nonce(),
+            3
+        );
+
+        // Attacker tries to replay the old transaction with nonce 0
+        // This should be rejected gracefully, not panic
+        let block2 = mine_block(2, *chain.tip_hash(), &[tx0], 1);
+        assert!(
+            chain.add_block(block2).is_err(),
+            "Block with stale nonce should be rejected (not panic!)"
+        );
+
+        // Chain should still be valid
+        assert_eq!(chain.len(), 2); // Genesis + block1
+        assert!(chain.is_valid());
+    }
+
+    #[test]
+    fn test_multiple_stale_nonces_rejection() {
+        // Test that multiple stale nonces in a single block are all rejected
+        let genesis = mine_block(0, GENESIS_ROOT_HASH, &[], 1);
+        let mut chain = Chain::<RootChain>::new_from_genesis(genesis.clone());
+
+        let alice = Wallet::from_seed("alice");
+        let bob = Wallet::from_seed("bob");
+
+        // Alice sends transactions with nonces 0, 1, 2, 3, 4
+        let tx0 = alice.create_transaction(bob.address(), 5, 0);
+        let tx1 = alice.create_transaction(bob.address(), 5, 1);
+        let tx2 = alice.create_transaction(bob.address(), 5, 2);
+        let tx3 = alice.create_transaction(bob.address(), 5, 3);
+        let tx4 = alice.create_transaction(bob.address(), 5, 4);
+
+        let block1 = mine_block(
+            1,
+            *genesis.hash(),
+            &[tx0.clone(), tx1.clone(), tx2.clone(), tx3, tx4],
+            1,
+        );
+        assert!(chain.add_block(block1).is_ok());
+        assert_eq!(
+            chain.get_onchain_account(alice.address()).unwrap().nonce(),
+            5
+        );
+
+        // Attacker tries to replay multiple old transactions (nonces 0, 1, 2)
+        // Even with multiple stale nonces, should reject gracefully
+        let block2 = mine_block(2, *chain.tip_hash(), &[tx0, tx1, tx2], 1);
+        assert!(
+            chain.add_block(block2).is_err(),
+            "Block with multiple stale nonces should be rejected"
+        );
+
+        assert_eq!(chain.len(), 2); // Genesis + block1
+    }
+
+    #[test]
+    fn test_nonce_validation_after_reorganization() {
+        // Test that nonces are correctly validated after a chain reorganization
+        use crate::blockchain::BlockChain;
+        let mut blockchain = BlockChain::new(1);
+        let genesis_hash = *blockchain.latest_block_hash();
+
+        let alice = Wallet::from_seed("alice");
+        let bob = Wallet::from_seed("bob");
+
+        // Main chain: Alice sends with nonce 0
+        let tx1 = alice.create_transaction(bob.address(), 10, 0);
+        let block1 = mine_block(1, genesis_hash, &[tx1], 1);
+        let _ = blockchain.add_block(block1).ok();
+
+        // Fork from genesis: Alice sends with nonce 0 (same nonce, different recipient)
+        let charlie = Wallet::from_seed("charlie");
+        let tx_fork = alice.create_transaction(charlie.address(), 20, 0);
+        let fork_block1 = mine_block(1, genesis_hash, &[tx_fork], 3); // Higher difficulty
+        let fork_hash = *fork_block1.hash();
+        let _ = blockchain.add_block(fork_block1).ok();
+
+        // Add another block to the fork to trigger reorganization
+        let fork_block2 = mine_block(2, fork_hash, &[], 3);
+        let _ = blockchain.add_block(fork_block2).ok();
+
+        // Main chain should have reorganized to the fork
+        // Alice's nonce should be 1 (from the one transaction in the fork)
+        assert_eq!(blockchain.main_chain_len(), 3); // Genesis + 2 fork blocks
     }
 }

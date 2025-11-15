@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // CLI output goes to stdout (using println!)
     println!("🔐 Your address: {}", node.my_address());
-    println!("💰 Balance: {}", node.get_balance_info());
+    println!("💰 Balance: {}", node.get_account_info());
     println!();
     println!("Commands:");
     println!("  balance              - Show your balance");
@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 match parts.as_slice() {
                     ["balance"] => {
-                        println!("💰 Balance: {}", node.get_balance_info());
+                        println!("💰 Balance: {}", node.get_account_info());
                     }
 
                     ["send", addr_str, amount_str] => {
