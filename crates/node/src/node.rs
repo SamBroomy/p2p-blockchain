@@ -8,6 +8,7 @@ use blockchain_types::{
     consts::MAX_BLOCKS_PER_REQUEST,
     wallet::{Address, Wallet},
 };
+use chrono::{DateTime, Utc};
 use libp2p::{
     PeerId,
     futures::StreamExt,
@@ -27,14 +28,59 @@ const SYNC_BATCH_SIZE: u64 = 100;
 /// Timeout for waiting for initial peer discovery (seconds)
 const PEER_DISCOVERY_TIMEOUT_SECS: u64 = 30;
 
+/// Peer reputation constants
+const INVALID_BLOCK_BAN_THRESHOLD: u32 = 10;
+const VALID_BLOCKS_FOR_DECAY: u32 = 10;
+const SCORE_DECAY_AMOUNT: u32 = 1;
+
+#[derive(Default)]
+struct PeerScore {
+    invalid_blocks_sent: u32,
+    valid_blocks_sent: u32,
+    last_violation: Option<DateTime<Utc>>,
+}
+
+impl PeerScore {
+    /// Record a valid block from this peer and apply decay to invalid count
+    fn record_valid_block(&mut self) {
+        self.valid_blocks_sent += 1;
+
+        // Decay: for every VALID_BLOCKS_FOR_DECAY valid blocks, reduce invalid count by SCORE_DECAY_AMOUNT
+        if self
+            .valid_blocks_sent
+            .is_multiple_of(VALID_BLOCKS_FOR_DECAY)
+        {
+            self.invalid_blocks_sent = self.invalid_blocks_sent.saturating_sub(SCORE_DECAY_AMOUNT);
+        }
+    }
+
+    /// Record invalid blocks from this peer
+    fn record_invalid_blocks(&mut self, count: u32) {
+        self.invalid_blocks_sent += count;
+        self.last_violation = Some(Utc::now());
+    }
+
+    /// Check if peer should be banned
+    fn should_ban(&self) -> bool {
+        self.invalid_blocks_sent >= INVALID_BLOCK_BAN_THRESHOLD
+    }
+}
+
 pub struct Node {
     pub blockchain: BlockChain<Miner>,
     pub mempool: Mempool,
     wallet: Wallet,
     pub swarm: Swarm<BlockchainBehaviour>,
-    // Trackpending requests (for responses)
-    pending_requests: HashMap<OutboundRequestId, SyncRequestType>,
+    // Track pending requests (for responses)
+    pending_requests: HashMap<OutboundRequestId, PendingRequest>,
     sync_state: SyncState,
+    peer_score: HashMap<PeerId, PeerScore>,
+}
+
+#[derive(Debug)]
+struct PendingRequest {
+    request_type: SyncRequestType,
+    peer_id: PeerId,
 }
 
 #[derive(Debug)]
@@ -85,9 +131,9 @@ impl Node {
             mempool: Mempool::new(),
             wallet,
             swarm,
-
             pending_requests: HashMap::new(),
             sync_state: SyncState::NotSynced,
+            peer_score: HashMap::new(),
         })
     }
 
@@ -95,7 +141,8 @@ impl Node {
     pub async fn run(&mut self) {
         // Bootstrap sync: wait for initial peer discovery
         info!("Waiting for initial peer discovery...");
-        let discovery_timeout = tokio::time::sleep(Duration::from_secs(PEER_DISCOVERY_TIMEOUT_SECS));
+        let discovery_timeout =
+            tokio::time::sleep(Duration::from_secs(PEER_DISCOVERY_TIMEOUT_SECS));
         tokio::pin!(discovery_timeout);
 
         let mut peer_discovered = false;
@@ -103,7 +150,7 @@ impl Node {
         // Wait for first peer or timeout
         loop {
             tokio::select! {
-                _ = &mut discovery_timeout => {
+                () = &mut discovery_timeout => {
                     warn!("Peer discovery timeout - proceeding in solo mode");
                     self.sync_state = SyncState::Synced;
                     break;
@@ -182,7 +229,7 @@ impl Node {
                         debug!(message = %String::from_utf8_lossy(&message.data), "Gossipsub message data");
                         // Deserialize and handle message
                         if let Ok(msg) = NetworkMessage::from_bytes(&message.data) {
-                            self.handle_network_message(msg);
+                            self.handle_network_message(msg, &peer_id);
                         }
                     }
                     BlockchainBehaviourEvent::RequestResponse(
@@ -293,8 +340,9 @@ impl Node {
     }
 
     fn handle_sync_response(&mut self, request_id: OutboundRequestId, response: SyncResponse) {
-        if let Some(request_type) = self.pending_requests.remove(&request_id) {
-            match (request_type, response) {
+        if let Some(pending_request) = self.pending_requests.remove(&request_id) {
+            let peer_id = pending_request.peer_id;
+            match (pending_request.request_type, response) {
                 (
                     SyncRequestType::Status,
                     SyncResponse::Status {
@@ -357,11 +405,23 @@ impl Node {
                         }
                     }
 
+                    // Update peer score based on validation
                     if invalid_count > 0 {
                         warn!(
+                            peer = %peer_id,
                             invalid_count = invalid_count,
                             "Peer sent unrequested blocks"
                         );
+                        let score = self.peer_score.entry(peer_id).or_default();
+                        score.record_invalid_blocks(invalid_count);
+
+                        if score.should_ban() {
+                            warn!(peer = %peer_id, "Banning peer for sending invalid blocks");
+                            self.swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .blacklist_peer(&peer_id);
+                        }
                     }
 
                     info!(
@@ -376,19 +436,33 @@ impl Node {
                                     processed_orphans = processed_orphans,
                                     "Added block, processed orphans"
                                 );
+                                // Reward peer for valid block
+                                self.peer_score
+                                    .entry(peer_id)
+                                    .or_default()
+                                    .record_valid_block();
                             }
                             BlockAddResult::Orphaned { missing_parent } => {
                                 // Still missing parent, request it
                                 self.request_blocks(vec![missing_parent]);
                             }
-                            BlockAddResult::Rejected(_) => {}
+                            BlockAddResult::Rejected(_) => {
+                                // Penalize peer for sending invalid block
+                                let score = self.peer_score.entry(peer_id).or_default();
+                                score.record_invalid_blocks(1);
+
+                                if score.should_ban() {
+                                    warn!(peer = %peer_id, "Banning peer for sending rejected blocks");
+                                    self.swarm
+                                        .behaviour_mut()
+                                        .gossipsub
+                                        .blacklist_peer(&peer_id);
+                                }
+                            }
                         }
                     }
                 }
-                (
-                    SyncRequestType::BlockRange { from, to },
-                    SyncResponse::Blocks(blocks),
-                ) => {
+                (SyncRequestType::BlockRange { from, to }, SyncResponse::Blocks(blocks)) => {
                     // Validate: blocks must be within requested range
                     let mut valid_blocks = Vec::new();
                     let mut invalid_count = 0;
@@ -407,11 +481,23 @@ impl Node {
                         }
                     }
 
+                    // Update peer score based on validation
                     if invalid_count > 0 {
                         warn!(
+                            peer = %peer_id,
                             invalid_count = invalid_count,
                             "Peer sent out-of-range blocks"
                         );
+                        let score = self.peer_score.entry(peer_id).or_default();
+                        score.record_invalid_blocks(invalid_count);
+
+                        if score.should_ban() {
+                            warn!(peer = %peer_id, "Banning peer for sending out-of-range blocks");
+                            self.swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .blacklist_peer(&peer_id);
+                        }
                     }
 
                     info!(
@@ -427,12 +513,29 @@ impl Node {
                                     processed_orphans = processed_orphans,
                                     "Added block, processed orphans"
                                 );
+                                // Reward peer for valid block
+                                self.peer_score
+                                    .entry(peer_id)
+                                    .or_default()
+                                    .record_valid_block();
                             }
                             BlockAddResult::Orphaned { missing_parent } => {
                                 // Still missing parent, request it
                                 self.request_blocks(vec![missing_parent]);
                             }
-                            BlockAddResult::Rejected(_) => {}
+                            BlockAddResult::Rejected(_) => {
+                                // Penalize peer for sending invalid block
+                                let score = self.peer_score.entry(peer_id).or_default();
+                                score.record_invalid_blocks(1);
+
+                                if score.should_ban() {
+                                    warn!(peer = %peer_id, "Banning peer for sending rejected blocks");
+                                    self.swarm
+                                        .behaviour_mut()
+                                        .gossipsub
+                                        .blacklist_peer(&peer_id);
+                                }
+                            }
                         }
                     }
 
@@ -475,7 +578,7 @@ impl Node {
         }
     }
 
-    fn handle_network_message(&mut self, msg: NetworkMessage) {
+    fn handle_network_message(&mut self, msg: NetworkMessage, peer: &PeerId) {
         match msg {
             NetworkMessage::Transaction(tx) => {
                 info!(tx_hash = ?tx.hash(), "Received transaction from network");
@@ -487,9 +590,30 @@ impl Node {
 
             NetworkMessage::Block(block) => {
                 info!(block_hash = ?block.hash(), "Received block from network");
-                if let BlockAddResult::Added { .. } = self.blockchain.add_block(block.clone()) {
-                    // Remove included transactions from mempool
-                    self.mempool.remove_transactions(block.transactions());
+                // TODO: block result should return transactions to remove from mempool so we don't need to clone the block.
+                match self.blockchain.add_block(block.clone()) {
+                    BlockAddResult::Added { .. } => {
+                        info!("Block added to blockchain");
+                        self.mempool.remove_transactions(block.transactions());
+                        self.peer_score
+                            .entry(*peer)
+                            .or_default()
+                            .record_valid_block();
+                    }
+                    BlockAddResult::Rejected(_) => {
+                        warn!(peer = %peer, "Block rejected");
+                        let score = self.peer_score.entry(*peer).or_default();
+                        score.record_invalid_blocks(1);
+
+                        if score.should_ban() {
+                            warn!(peer = %peer, "Banning peer for sending rejected blocks");
+                            self.swarm.behaviour_mut().gossipsub.blacklist_peer(peer);
+                        }
+                    }
+                    BlockAddResult::Orphaned { missing_parent } => {
+                        info!(missing_parent = ?missing_parent, "Block is orphaned, requesting parent");
+                        self.request_blocks(vec![missing_parent]);
+                    }
                 }
             }
         }
@@ -528,8 +652,13 @@ impl Node {
             .behaviour_mut()
             .request_response
             .send_request(peer, SyncRequest::Status);
-        self.pending_requests
-            .insert(request_id, SyncRequestType::Status);
+        self.pending_requests.insert(
+            request_id,
+            PendingRequest {
+                request_type: SyncRequestType::Status,
+                peer_id: *peer,
+            },
+        );
     }
 
     /// Request status from ONE random peer
@@ -558,8 +687,13 @@ impl Node {
             .request_response
             .send_request(&peer, SyncRequest::Blocks(hashes.clone()));
 
-        self.pending_requests
-            .insert(request_id, SyncRequestType::Blocks(hashes));
+        self.pending_requests.insert(
+            request_id,
+            PendingRequest {
+                request_type: SyncRequestType::Blocks(hashes),
+                peer_id: peer,
+            },
+        );
     }
 
     fn request_block_range(&mut self, from_height: u64, to_height: u64) {
@@ -581,9 +715,12 @@ impl Node {
 
         self.pending_requests.insert(
             request_id,
-            SyncRequestType::BlockRange {
-                from: from_height,
-                to: to_height,
+            PendingRequest {
+                request_type: SyncRequestType::BlockRange {
+                    from: from_height,
+                    to: to_height,
+                },
+                peer_id: peer,
             },
         );
     }
