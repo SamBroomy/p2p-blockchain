@@ -48,7 +48,15 @@ impl BlockConstructor {
 
         // Prepend block reward if miner address provided
         if let Some(miner_addr) = miner_address {
-            let reward_tx = TransactionConstructor::block_reward(&miner_addr, BLOCK_REWARD_AMOUNT);
+            // Calculate total fees from transactions
+            let total_fees: u64 = transactions
+                .iter()
+                .filter_map(|tx| tx.fee())
+                .sum();
+
+            // Block reward = base reward + transaction fees
+            let total_reward = BLOCK_REWARD_AMOUNT + total_fees;
+            let reward_tx = TransactionConstructor::block_reward(&miner_addr, total_reward);
             debug_assert!(
                 reward_tx.is_validate(),
                 "Block reward transaction must be valid"
@@ -369,7 +377,7 @@ mod tests {
     fn test_block_with_transactions() {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
-        let tx = wallet1.create_transaction(wallet2.address(), 50, 0);
+        let tx = wallet1.create_transaction(wallet2.address(), 50, 0, None);
 
         let previous_hash = Hash::from_bytes([0u8; 32]);
         let constructor = BlockConstructor::new(0, &[tx], previous_hash, None);
@@ -434,8 +442,8 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx1 = wallet1.create_transaction(wallet2.address(), 25, 0);
-        let tx2 = wallet1.create_transaction(wallet2.address(), 15, 1);
+        let tx1 = wallet1.create_transaction(wallet2.address(), 25, 0, None);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 15, 1, None);
 
         let constructor = BlockConstructor::new(
             0,
@@ -462,7 +470,8 @@ mod tests {
             miner_wallet.address(),
             "Reward should go to miner"
         );
-        assert_eq!(reward_tx.amount(), 50, "Block reward should be 50");
+        // Block reward = 50 (base) + 2 (fees from tx1 and tx2 @ 1 each)
+        assert_eq!(reward_tx.amount(), 52, "Block reward should be 50 + 2 fees");
 
         assert_eq!(
             block.transactions()[1].hash(),
@@ -485,7 +494,7 @@ mod tests {
 
         let mut transactions = Vec::new();
         for i in 0..(MAX_TRANSACTIONS_PER_BLOCK - 1) {
-            transactions.push(wallet1.create_transaction(wallet2.address(), 1, i as u64));
+            transactions.push(wallet1.create_transaction(wallet2.address(), 1, i as u64, None));
         }
 
         let constructor = BlockConstructor::new(
@@ -516,7 +525,7 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx = wallet1.create_transaction(wallet2.address(), 25, 0);
+        let tx = wallet1.create_transaction(wallet2.address(), 25, 0, None);
 
         // Create block with reward as first transaction (valid)
         let constructor = BlockConstructor::new(
@@ -545,8 +554,8 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
 
-        let tx1 = wallet1.create_transaction(wallet2.address(), 10, 0);
-        let tx2 = wallet1.create_transaction(wallet2.address(), 20, 1);
+        let tx1 = wallet1.create_transaction(wallet2.address(), 10, 0, None);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 20, 1, None);
 
         // Create block without miner address (no reward)
         let constructor =
@@ -589,14 +598,14 @@ mod tests {
         // Valid: block with reward + user transactions
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
-        let tx = wallet1.create_transaction(wallet2.address(), 10, 0);
+        let tx = wallet1.create_transaction(wallet2.address(), 10, 0, None);
         let constructor = BlockConstructor::new(0, &[tx], previous_hash, Some(*miner.address()));
         let block = Miner::mine(constructor, 1, None);
         assert!(utils::is_valid_block_reward_structure(block.transactions()));
 
         // Valid: block with only user transactions (no reward)
-        let tx1 = wallet1.create_transaction(wallet2.address(), 5, 0);
-        let tx2 = wallet1.create_transaction(wallet2.address(), 15, 1);
+        let tx1 = wallet1.create_transaction(wallet2.address(), 5, 0, None);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 15, 1, None);
         let constructor = BlockConstructor::new(0, &[tx1, tx2], previous_hash, None);
         let block = Miner::mine(constructor, 1, None);
         assert!(utils::is_valid_block_reward_structure(block.transactions()));
@@ -610,8 +619,8 @@ mod tests {
         let wallet2 = Wallet::new();
 
         // Create a few transactions
-        let tx1 = wallet1.create_transaction(wallet2.address(), 10, 0);
-        let tx2 = wallet1.create_transaction(wallet2.address(), 20, 1);
+        let tx1 = wallet1.create_transaction(wallet2.address(), 10, 0, None);
+        let tx2 = wallet1.create_transaction(wallet2.address(), 20, 1, None);
 
         let constructor = BlockConstructor::new(0, &[tx1, tx2], previous_hash, None);
         let block = Miner::mine(constructor, 1, None);
@@ -637,7 +646,7 @@ mod tests {
         // So this should still pass
         let mut txs = Vec::new();
         for i in 0..MAX_TRANSACTIONS_PER_BLOCK {
-            txs.push(wallet1.create_transaction(wallet2.address(), (i % 100) as u64 + 1, i as u64));
+            txs.push(wallet1.create_transaction(wallet2.address(), (i % 100) as u64 + 1, i as u64, None));
         }
 
         let constructor = BlockConstructor::new(0, &txs, previous_hash, None);
@@ -663,7 +672,7 @@ mod tests {
         let size_empty = utils::estimate_block_size(&block);
 
         // Block with one transaction
-        let tx = wallet1.create_transaction(wallet2.address(), 50, 0);
+        let tx = wallet1.create_transaction(wallet2.address(), 50, 0, None);
         let constructor = BlockConstructor::new(0, &[tx], previous_hash, None);
         let block_with_tx = Miner::mine(constructor, 1, None);
         let size_with_tx = utils::estimate_block_size(&block_with_tx);

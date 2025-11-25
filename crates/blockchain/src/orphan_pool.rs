@@ -257,7 +257,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "This test would be slow in practice due to waiting"]
     fn test_prune_expired_orphans() {
         let mut pool = OrphanPool::new();
         let parent_hash = Hash::from_bytes([1u8; 32]);

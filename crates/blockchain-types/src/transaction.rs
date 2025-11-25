@@ -17,6 +17,7 @@ impl TransactionConstructor {
         receiver: &Address,
         amount: u64,
         nonce: u64,
+        fee: impl Into<Option<BlockFee>>,
         sender_private_key: &PrivateKey,
     ) -> Transaction {
         debug_assert!(amount > 0, "Transaction amount must be greater than 0");
@@ -25,7 +26,10 @@ impl TransactionConstructor {
             receiver.as_bytes(),
             "Sender and receiver must be different"
         );
-        let inner = InnerTransaction::new(*sender, *receiver, amount, nonce);
+        let inner = InnerTransaction::new(
+            *sender, *receiver, amount, nonce,
+            fee.into().unwrap_or_default(),
+        );
         // 1. hash the transaction data
         let message_hash = inner.hash();
         // 2. sign the hash with sender's private key
@@ -47,6 +51,37 @@ impl TransactionConstructor {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum BlockFee {
+    #[default]
+    Low,
+    Medium,
+    High,
+    Custom(u64),
+}
+
+impl BlockFee {
+    pub fn fee_amount(&self) -> u64 {
+        match self {
+            Self::Low => 1,
+            Self::Medium => 5,
+            Self::High => 10,
+            Self::Custom(amount) => *amount,
+        }
+    }
+}
+
+impl From<u64> for BlockFee {
+    fn from(amount: u64) -> Self {
+        match amount {
+            1 => Self::Low,
+            5 => Self::Medium,
+            10 => Self::High,
+            _ => Self::Custom(amount),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum TransactionType {
@@ -54,6 +89,7 @@ enum TransactionType {
         sender: Address,
         receiver: Address,
         nonce: u64,
+        fee: BlockFee,
     },
     BlockReward {
         miner: Address,
@@ -72,12 +108,13 @@ impl InnerTransaction {
         utils::hash_inner_transaction(Hasher::new(), self)
     }
 
-    fn new(sender: Address, receiver: Address, amount: u64, nonce: u64) -> Self {
+    fn new(sender: Address, receiver: Address, amount: u64, nonce: u64, fee: BlockFee) -> Self {
         Self {
             tx_type: TransactionType::Transfer {
                 sender,
                 receiver,
                 nonce,
+                fee,
             },
             amount,
             timestamp: Utc::now(),
@@ -178,6 +215,45 @@ impl Transaction {
             TransactionType::BlockReward { .. } => None,
         }
     }
+
+    pub fn fee(&self) -> Option<u64> {
+        match &self.inner.tx_type {
+            TransactionType::Transfer { fee, .. } => Some(fee.fee_amount()),
+            TransactionType::BlockReward { .. } => None,
+        }
+    }
+}
+
+// Implement ordering for priority queue (max-heap in BinaryHeap)
+// Higher fees have higher priority (come first)
+impl Ord for Transaction {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Primary: Compare by fee (higher fee = higher priority)
+        // Block rewards have no fee, treat as 0
+        let self_fee = self.fee().unwrap_or(0);
+        let other_fee = other.fee().unwrap_or(0);
+
+        match self_fee.cmp(&other_fee) {
+            std::cmp::Ordering::Equal => {
+                // Secondary: Compare by timestamp (older = higher priority for fairness)
+                // Reverse order so older timestamps come first
+                match other.timestamp().cmp(&self.timestamp()) {
+                    std::cmp::Ordering::Equal => {
+                        // Tertiary: Compare by hash for determinism
+                        self.hash().as_bytes().cmp(other.hash().as_bytes())
+                    }
+                    ordering => ordering,
+                }
+            }
+            ordering => ordering,
+        }
+    }
+}
+
+impl PartialOrd for Transaction {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 mod utils {
@@ -195,11 +271,13 @@ mod utils {
                 sender,
                 receiver,
                 nonce,
+                fee,
             } => {
                 hasher.update(b"transfer"); // Type discriminator
                 hasher.update(sender.as_bytes());
                 hasher.update(receiver.as_bytes());
                 hasher.update(&nonce.to_le_bytes());
+                hasher.update(&fee.fee_amount().to_le_bytes());
             }
             TransactionType::BlockReward { miner } => {
                 hasher.update(b"block_reward"); // Type discriminator
@@ -384,7 +462,7 @@ mod tests {
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
         let tx =
-            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, 0, &sender_sk);
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, 0, None, &sender_sk);
 
         assert_eq!(tx.sender(), Some(&sender_pk));
         assert_eq!(tx.receiver(), &receiver_pk);
@@ -403,7 +481,7 @@ mod tests {
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
         let tx =
-            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 50, 0, &sender_sk);
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 50, 0, None, &sender_sk);
 
         assert!(tx.is_validate());
     }
@@ -418,7 +496,7 @@ mod tests {
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
         let tx =
-            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 75, 0, &sender_sk);
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 75, 0, None, &sender_sk);
         let hash1 = tx.hash();
         let hash2 = tx.hash();
 
@@ -435,7 +513,7 @@ mod tests {
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
         let tx =
-            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 123, 0, &sender_sk);
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 123, 0, None, &sender_sk);
 
         let serialized = serde_json::to_string(&tx).expect("serialization failed");
         let deserialized: Transaction =
@@ -455,8 +533,8 @@ mod tests {
         let sender = Wallet::new();
         let receiver = Wallet::new();
 
-        let tx1 = sender.create_transaction(receiver.address(), 50, 0);
-        let tx2 = sender.create_transaction(receiver.address(), 50, 1);
+        let tx1 = sender.create_transaction(receiver.address(), 50, 0, None);
+        let tx2 = sender.create_transaction(receiver.address(), 50, 1, None);
 
         // Same sender, receiver, amount, but different nonce = different hash
         assert_ne!(
@@ -474,10 +552,10 @@ mod tests {
         let receiver = Wallet::new();
 
         // Create transaction with nonce 0
-        let tx1 = sender.create_transaction(receiver.address(), 50, 0);
+        let tx1 = sender.create_transaction(receiver.address(), 50, 0, None);
 
         // Create another transaction with different nonce
-        let tx2 = sender.create_transaction(receiver.address(), 50, 1);
+        let tx2 = sender.create_transaction(receiver.address(), 50, 1, None);
 
         // Different nonces = different transactions
         assert_ne!(
@@ -544,7 +622,7 @@ mod tests {
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
         let tx =
-            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, 0, &sender_sk);
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, 0, None, &sender_sk);
 
         assert_eq!(tx.sender(), Some(&sender_pk), "Transfer should have sender");
         assert_eq!(tx.receiver(), &receiver_pk);
@@ -595,7 +673,7 @@ mod tests {
             Address::from_verifying_key(SigningKey::generate(&mut OsRng).verifying_key());
 
         let tx =
-            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, 0, &sender_sk);
+            TransactionConstructor::new_transaction(&sender_pk, &receiver_pk, 100, 0, None, &sender_sk);
 
         // Should pass validation (uses serde_valid under the hood)
         let serialized = serde_json::to_string(&tx).expect("serialization failed");
@@ -622,6 +700,7 @@ mod tests {
                 sender: sender_pk,
                 receiver: receiver_pk,
                 nonce: 0,
+                fee: BlockFee::default(),
             },
             amount: 100,
             timestamp: far_future,

@@ -6,7 +6,7 @@ use ed25519_dalek::SigningKey;
 use private_key::PrivateKey;
 use rand::rngs::OsRng;
 
-use crate::transaction::{Transaction, TransactionConstructor};
+use crate::transaction::{BlockFee, Transaction, TransactionConstructor};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wallet {
@@ -48,6 +48,7 @@ impl Wallet {
         receiver_address: &Address,
         amount: u64,
         nonce: u64,
+        fee: impl Into<Option<BlockFee>>,
     ) -> Transaction {
         debug_assert!(amount > 0, "Transaction amount must be > 0");
         debug_assert_ne!(
@@ -61,6 +62,7 @@ impl Wallet {
             receiver_address,
             amount,
             nonce,
+            fee,
             &self.private_key,
         )
     }
@@ -106,7 +108,7 @@ mod tests {
         let sender = Wallet::new();
         let receiver = Wallet::new();
 
-        let tx = sender.create_transaction(receiver.address(), 100, 1);
+        let tx = sender.create_transaction(receiver.address(), 100, 1, None);
 
         assert_eq!(tx.sender(), Some(sender.address()));
         assert_eq!(tx.receiver(), receiver.address());

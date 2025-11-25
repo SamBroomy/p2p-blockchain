@@ -102,7 +102,9 @@ fn update_deltas(deltas: &mut AccountDelta, txs: &[Transaction]) {
     for tx in txs {
         *deltas.entry(*tx.receiver()).or_insert(0) += tx.amount() as Delta;
         if let Some(sender) = tx.sender() {
-            *deltas.entry(*sender).or_insert(0) -= tx.amount() as Delta;
+            // Subtract amount AND fee from sender
+            let total_cost = tx.amount() + tx.fee().unwrap_or(0);
+            *deltas.entry(*sender).or_insert(0) -= total_cost as Delta;
         }
     }
 }
@@ -111,6 +113,11 @@ fn get_transaction_deltas(txs: &[Transaction]) -> AccountDelta {
     let mut deltas = HashMap::new();
     update_deltas(&mut deltas, txs);
     deltas
+}
+
+/// Calculate total fees from all transactions in a block
+pub fn calculate_total_fees(txs: &[Transaction]) -> u64 {
+    txs.iter().filter_map(Transaction::fee).sum()
 }
 /// Validate that applying the deltas to the current balances will not result in negative balances
 fn validate_balance_deltas(balances: &AccountBalances, deltas: &AccountDelta) -> bool {
@@ -846,20 +853,20 @@ mod tests {
         let charlie = Wallet::from_seed("charlie");
 
         // Block 1: Alice sends 30 to Bob
-        let tx1 = alice.create_transaction(bob.address(), 30, 0);
+        let tx1 = alice.create_transaction(bob.address(), 30, 0, None);
         let block1 = mine_block(1, *genesis.hash(), &[tx1], 1);
         let block1_hash = *block1.hash();
         chain.add_block(block1).unwrap();
 
         // Block 2: Alice sends 20 to Charlie
-        let tx2 = alice.create_transaction(charlie.address(), 20, 1);
+        let tx2 = alice.create_transaction(charlie.address(), 20, 1, None);
         let block2 = mine_block(2, block1_hash, &[tx2], 1);
         let block2_hash = *block2.hash();
         chain.add_block(block2.clone()).unwrap();
 
         // Block 3: Bob sends 10 to Charlie
         let bob_wallet = Wallet::from_seed("bob");
-        let tx3 = bob_wallet.create_transaction(charlie.address(), 10, 0);
+        let tx3 = bob_wallet.create_transaction(charlie.address(), 10, 0, None);
         let block3 = mine_block(3, block2_hash, &[tx3], 1);
         chain.add_block(block3.clone()).unwrap();
 
@@ -980,12 +987,12 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Block 1: Alice sends 30 to Bob (valid)
-        let tx1 = alice.create_transaction(bob.address(), 30, 0);
+        let tx1 = alice.create_transaction(bob.address(), 30, 0, None);
         let block1 = mine_block(1, *genesis.hash(), &[tx1], 1);
         chain.add_block(block1).unwrap();
 
         // Create a fork from genesis with a transaction that would overdraw
-        let tx_invalid = alice.create_transaction(bob.address(), 150, 1); // Alice only has 100!
+        let tx_invalid = alice.create_transaction(bob.address(), 150, 1, None); // Alice only has 100!
         let invalid_block = mine_block(1, GENESIS_ROOT_HASH, &[tx_invalid], 1);
 
         // Creating a fork with invalid balances should fail
@@ -1160,10 +1167,10 @@ mod tests {
         let alice = Wallet::from_seed("alice");
         let bob = Wallet::from_seed("bob");
 
-        let tx1 = alice.create_transaction(bob.address(), 25, 0);
+        let tx1 = alice.create_transaction(bob.address(), 25, 0, None);
         let block1 = mine_block(1, *genesis.hash(), &[tx1], 1);
 
-        let tx2 = alice.create_transaction(bob.address(), 25, 1); // Fixed: should be nonce 1
+        let tx2 = alice.create_transaction(bob.address(), 25, 1, None); // Fixed: should be nonce 1
         let block2 = mine_block(2, *block1.hash(), &[tx2], 1);
 
         let blocks = vec![genesis, block1, block2];
@@ -1200,7 +1207,7 @@ mod tests {
         let wallet2 = Wallet::new();
 
         // Fork block B transfers 50 from wallet1 to wallet2
-        let tx = wallet1.create_transaction(wallet2.address(), 50, 0);
+        let tx = wallet1.create_transaction(wallet2.address(), 50, 0, None);
         let fork_block = mine_block(1, GENESIS_ROOT_HASH, &[tx], 2);
 
         // Create fork with empty starting balances (genesis fork)
@@ -1230,14 +1237,14 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Valid transaction: Alice sends 50 to Bob
-        let tx_valid = alice.create_transaction(bob.address(), 50, 0);
+        let tx_valid = alice.create_transaction(bob.address(), 50, 0, None);
         assert!(
             chain.validate_transaction(&tx_valid),
             "Valid transaction should be accepted"
         );
 
         // Invalid transaction: Alice tries to send 150 to Bob (only has 100)
-        let tx_invalid = alice.create_transaction(bob.address(), 150, 1);
+        let tx_invalid = alice.create_transaction(bob.address(), 150, 1, None);
         assert!(
             !chain.validate_transaction(&tx_invalid),
             "Invalid transaction should be rejected"
@@ -1254,7 +1261,7 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Block 1: Alice sends with nonce 0
-        let tx1 = alice.create_transaction(bob.address(), 10, 0);
+        let tx1 = alice.create_transaction(bob.address(), 10, 0, None);
         let block1 = mine_block(1, *genesis.hash(), &[tx1], 1);
         assert!(
             chain.add_block(block1).is_ok(),
@@ -1262,7 +1269,7 @@ mod tests {
         );
 
         // Block 2: Alice sends with nonce 1
-        let tx2 = alice.create_transaction(bob.address(), 10, 1);
+        let tx2 = alice.create_transaction(bob.address(), 10, 1, None);
         let block2 = mine_block(2, *chain.tip_hash(), &[tx2], 1);
         assert!(
             chain.add_block(block2).is_ok(),
@@ -1270,7 +1277,7 @@ mod tests {
         );
 
         // Block 3: Alice sends with nonce 2
-        let tx3 = alice.create_transaction(bob.address(), 10, 2);
+        let tx3 = alice.create_transaction(bob.address(), 10, 2, None);
         let block3 = mine_block(3, *chain.tip_hash(), &[tx3], 1);
         assert!(
             chain.add_block(block3).is_ok(),
@@ -1294,8 +1301,8 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Try to include two transactions with the same nonce in one block
-        let tx1 = alice.create_transaction(bob.address(), 10, 0);
-        let tx2 = alice.create_transaction(bob.address(), 20, 0); // Duplicate nonce!
+        let tx1 = alice.create_transaction(bob.address(), 10, 0, None);
+        let tx2 = alice.create_transaction(bob.address(), 20, 0, None); // Duplicate nonce!
 
         let block1 = mine_block(1, *genesis.hash(), &[tx1, tx2], 1);
         assert!(
@@ -1314,12 +1321,12 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Block 1: Alice sends with nonce 0
-        let tx1 = alice.create_transaction(bob.address(), 10, 0);
+        let tx1 = alice.create_transaction(bob.address(), 10, 0, None);
         let block1 = mine_block(1, *genesis.hash(), &[tx1], 1);
         assert!(chain.add_block(block1).is_ok());
 
         // Block 2: Alice sends with nonce 2 (skipping nonce 1!)
-        let tx2 = alice.create_transaction(bob.address(), 10, 2);
+        let tx2 = alice.create_transaction(bob.address(), 10, 2, None);
         let block2 = mine_block(2, *chain.tip_hash(), &[tx2], 1);
         assert!(
             chain.add_block(block2).is_err(),
@@ -1338,9 +1345,9 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Include transactions with nonces 0, 2, 1 (out of order in the array)
-        let tx0 = alice.create_transaction(bob.address(), 10, 0);
-        let tx2 = alice.create_transaction(bob.address(), 10, 2);
-        let tx1 = alice.create_transaction(bob.address(), 10, 1);
+        let tx0 = alice.create_transaction(bob.address(), 10, 0, None);
+        let tx2 = alice.create_transaction(bob.address(), 10, 2, None);
+        let tx1 = alice.create_transaction(bob.address(), 10, 1, None);
 
         let block1 = mine_block(1, *genesis.hash(), &[tx0, tx2, tx1], 1);
         assert!(
@@ -1366,9 +1373,9 @@ mod tests {
         let charlie = Wallet::from_seed("charlie");
 
         // Alice sends to Charlie with nonce 0
-        let tx_alice = alice.create_transaction(charlie.address(), 10, 0);
+        let tx_alice = alice.create_transaction(charlie.address(), 10, 0, None);
         // Bob sends to Charlie with nonce 0 (same nonce, different sender)
-        let tx_bob = bob.create_transaction(charlie.address(), 10, 0);
+        let tx_bob = bob.create_transaction(charlie.address(), 10, 0, None);
 
         let block1 = mine_block(1, *genesis.hash(), &[tx_alice, tx_bob], 1);
         assert!(
@@ -1394,8 +1401,8 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Block 1: Alice sends 2 transactions (nonce 0, 1)
-        let tx0 = alice.create_transaction(bob.address(), 10, 0);
-        let tx1 = alice.create_transaction(bob.address(), 10, 1);
+        let tx0 = alice.create_transaction(bob.address(), 10, 0, None);
+        let tx1 = alice.create_transaction(bob.address(), 10, 1, None);
         let block1 = mine_block(1, *genesis.hash(), &[tx0, tx1], 1);
         assert!(chain.add_block(block1).is_ok());
         assert_eq!(
@@ -1404,7 +1411,7 @@ mod tests {
         );
 
         // Block 2: Alice sends 1 transaction (nonce 2)
-        let tx2 = alice.create_transaction(bob.address(), 10, 2);
+        let tx2 = alice.create_transaction(bob.address(), 10, 2, None);
         let block2 = mine_block(2, *chain.tip_hash(), &[tx2], 1);
         assert!(chain.add_block(block2).is_ok());
         assert_eq!(
@@ -1413,9 +1420,9 @@ mod tests {
         );
 
         // Block 3: Alice sends 3 transactions (nonce 3, 4, 5)
-        let tx3 = alice.create_transaction(bob.address(), 10, 3);
-        let tx4 = alice.create_transaction(bob.address(), 10, 4);
-        let tx5 = alice.create_transaction(bob.address(), 10, 5);
+        let tx3 = alice.create_transaction(bob.address(), 10, 3, None);
+        let tx4 = alice.create_transaction(bob.address(), 10, 4, None);
+        let tx5 = alice.create_transaction(bob.address(), 10, 5, None);
         let block3 = mine_block(3, *chain.tip_hash(), &[tx3, tx4, tx5], 1);
         assert!(chain.add_block(block3).is_ok());
         assert_eq!(
@@ -1435,9 +1442,9 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Alice sends transactions with nonces 0, 1, 2
-        let tx0 = alice.create_transaction(bob.address(), 10, 0);
-        let tx1 = alice.create_transaction(bob.address(), 10, 1);
-        let tx2 = alice.create_transaction(bob.address(), 10, 2);
+        let tx0 = alice.create_transaction(bob.address(), 10, 0, None);
+        let tx1 = alice.create_transaction(bob.address(), 10, 1, None);
+        let tx2 = alice.create_transaction(bob.address(), 10, 2, None);
 
         let block1 = mine_block(1, *genesis.hash(), &[tx0.clone(), tx1, tx2], 1);
         assert!(chain.add_block(block1).is_ok());
@@ -1471,11 +1478,11 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Alice sends transactions with nonces 0, 1, 2, 3, 4
-        let tx0 = alice.create_transaction(bob.address(), 5, 0);
-        let tx1 = alice.create_transaction(bob.address(), 5, 1);
-        let tx2 = alice.create_transaction(bob.address(), 5, 2);
-        let tx3 = alice.create_transaction(bob.address(), 5, 3);
-        let tx4 = alice.create_transaction(bob.address(), 5, 4);
+        let tx0 = alice.create_transaction(bob.address(), 5, 0, None);
+        let tx1 = alice.create_transaction(bob.address(), 5, 1, None);
+        let tx2 = alice.create_transaction(bob.address(), 5, 2, None);
+        let tx3 = alice.create_transaction(bob.address(), 5, 3, None);
+        let tx4 = alice.create_transaction(bob.address(), 5, 4, None);
 
         let block1 = mine_block(
             1,
@@ -1511,13 +1518,13 @@ mod tests {
         let bob = Wallet::from_seed("bob");
 
         // Main chain: Alice sends with nonce 0
-        let tx1 = alice.create_transaction(bob.address(), 10, 0);
+        let tx1 = alice.create_transaction(bob.address(), 10, 0, None);
         let block1 = mine_block(1, genesis_hash, &[tx1], 1);
         let _ = blockchain.add_block(block1).ok();
 
         // Fork from genesis: Alice sends with nonce 0 (same nonce, different recipient)
         let charlie = Wallet::from_seed("charlie");
-        let tx_fork = alice.create_transaction(charlie.address(), 20, 0);
+        let tx_fork = alice.create_transaction(charlie.address(), 20, 0, None);
         let fork_block1 = mine_block(1, genesis_hash, &[tx_fork], 3); // Higher difficulty
         let fork_hash = *fork_block1.hash();
         let _ = blockchain.add_block(fork_block1).ok();

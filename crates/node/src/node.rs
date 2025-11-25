@@ -785,7 +785,7 @@ impl Node {
         // 2. Create the transaction
         let tx = self
             .wallet
-            .create_transaction(receiver_address, amount, next_nonce);
+            .create_transaction(receiver_address, amount, next_nonce, None);
         // 3. Double-check against blockchain state (should always pass after step 1)
         // This catches race conditions or state inconsistencies
         debug_assert!(
