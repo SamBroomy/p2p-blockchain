@@ -10,3 +10,4 @@
 !justfile
 !rust-toolchain.toml
 !rustfmt.toml
+!README.md
